@@ -9,6 +9,9 @@ Usage:
     python gepa_hotpotqa.py --optimizer mipro --auto light
     python gepa_hotpotqa.py --optimizer bootstrap --max_rounds 3
     python gepa_hotpotqa.py --optimizer baseline  # No optimization, just evaluate
+
+TODO:
+- [ ] Enable usage of context per sample so that perform actual multi-hop reasoning.
 """
 
 from __future__ import annotations
