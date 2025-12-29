@@ -205,40 +205,7 @@ def setup_model(model_name: str = DEFAULT_MODEL, api_base: str = DEFAULT_API_BAS
 # PROGRAM DEFINITION
 # ============================================================================
 
-
-class QAModule(dspy.Module):
-    """Multi-step QA module with separate think and answer predictors.
-
-    This module uses a two-stage approach:
-    1. Think: Analyze the question and generate reasoning
-    2. Answer: Use the reasoning to produce a concise answer
-
-    GEPA and other optimizers can optimize both predictor instructions independently.
-    """
-
-    def __init__(self):
-        super().__init__()
-        # self.think = dspy.ChainOfThought(
-        #     dspy.Signature(
-        #         "question -> reasoning",
-        #         "Analyze the question and think through what information is needed.",
-        #     )
-        # )
-        self.answer = dspy.Predict(
-            dspy.Signature(
-                "question -> answer",
-            )
-        )
-
-    def forward(self, question: str) -> Prediction:
-        # think_result = self.think(question=question)
-        # return self.answer(question=question, reasoning=think_result.reasoning)
-        return self.answer(question=question)
-
-
-def create_program() -> QAModule:
-    """Create and return a fresh QA program instance."""
-    return QAModule()
+from programs import PROGRAMS, create_program
 
 # ============================================================================
 # EVALUATION
@@ -485,7 +452,7 @@ def run_benchmark(
 
     # Setup model and program
     setup_model(args.model, args.api_base)
-    program = create_program()
+    program = create_program(args.program)
 
     # Evaluate baseline
     _print_section("BASELINE EVALUATION")
@@ -546,6 +513,16 @@ def parse_args() -> argparse.Namespace:
     model_group = parser.add_argument_group("Model")
     model_group.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Model name")
     model_group.add_argument("--api_base", type=str, default=DEFAULT_API_BASE, help="API base URL")
+
+    # Program arguments
+    program_group = parser.add_argument_group("Program")
+    program_group.add_argument(
+        "--program",
+        type=str,
+        default="naive",
+        choices=list(PROGRAMS.keys()),
+        help="Program type: 'naive' (direct QA) or 'reasoning' (two-stage reasoning-first)",
+    )
 
     # General optimizer arguments
     opt_group = parser.add_argument_group("Optimizer")
