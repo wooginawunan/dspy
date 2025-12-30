@@ -9,9 +9,10 @@ Usage:
     python gepa_hotpotqa.py --optimizer mipro --auto light
     python gepa_hotpotqa.py --optimizer bootstrap --max_rounds 3
     python gepa_hotpotqa.py --optimizer baseline  # No optimization, just evaluate
-
-TODO:
-- [ ] Enable usage of context per sample so that perform actual multi-hop reasoning.
+    
+    # With context (uses gold passages from HotPotQA):
+    python gepa_hotpotqa.py --program context --optimizer baseline
+    python gepa_hotpotqa.py --program reasoning_context --optimizer gepa
 """
 
 from __future__ import annotations
@@ -156,6 +157,7 @@ def load_dataset(
     dev_size: int = 100,
     test_size: int = 0,
     keep_details: bool = True,
+    use_context: bool = False,
 ) -> tuple[list[Example], list[Example], list[Example]]:
     """Load and prepare the HotPotQA dataset.
 
@@ -166,9 +168,10 @@ def load_dataset(
         dev_size: Number of validation examples.
         test_size: Number of test examples.
         keep_details: Whether to keep detailed metadata.
+        use_context: Whether to include context as an input field.
 
     Returns:
-        Tuple of (train_set, val_set, test_set) with question as input.
+        Tuple of (train_set, val_set, test_set) with appropriate inputs.
 
     Note:
         Always uses hard examples (only_hard_examples=True) for proper benchmarking.
@@ -183,11 +186,14 @@ def load_dataset(
         keep_details=keep_details,
     )
 
-    train_set = [ex.with_inputs("question") for ex in dataset.train]
-    val_set = [ex.with_inputs("question") for ex in dataset.dev]
-    test_set = [ex.with_inputs("question") for ex in dataset.test]
+    input_fields = ("question", "context") if use_context else ("question",)
+    
+    train_set = [ex.with_inputs(*input_fields) for ex in dataset.train]
+    val_set = [ex.with_inputs(*input_fields) for ex in dataset.dev]
+    test_set = [ex.with_inputs(*input_fields) for ex in dataset.test]
 
-    print(f"Dataset loaded: Train={len(train_set)}, Val={len(val_set)}, Test={len(test_set)}")
+    ctx_status = "with context" if use_context else "question only"
+    print(f"Dataset loaded ({ctx_status}): Train={len(train_set)}, Val={len(val_set)}, Test={len(test_set)}")
     return train_set, val_set, test_set
 
 
@@ -444,6 +450,9 @@ def run_benchmark(
         Tuple of (baseline_results, optimized_results, optimized_program).
         optimized_results and optimized_program are None for baseline runs.
     """
+    # Determine if program uses context
+    use_context = args.program in ("context", "reasoning_context")
+    
     # Load dataset
     train_set, val_set, _ = load_dataset(
         train_seed=args.train_seed,
@@ -451,6 +460,7 @@ def run_benchmark(
         eval_seed=args.eval_seed,
         dev_size=args.dev_size,
         test_size=args.test_size,
+        use_context=use_context,
     )
 
     # Setup model and program
@@ -524,7 +534,10 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="naive",
         choices=list(PROGRAMS.keys()),
-        help="Program type: 'naive' (direct QA) or 'reasoning' (two-stage reasoning-first)",
+        help=(
+            "Program type: 'naive' (direct QA), 'reasoning' (two-stage reasoning-first), "
+            "'context' (uses gold passages), 'reasoning_context' (reasoning with passages)"
+        ),
     )
 
     # General optimizer arguments
