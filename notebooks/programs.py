@@ -87,6 +87,42 @@ class ContextQA(dspy.Module):
         return self.answer(context=context_str, question=question)
 
 
+class MLflowBasePromptContextQA(dspy.Module):
+    """QA module with a structured base prompt for context-based question answering.
+    
+    This module implements the base prompt from the MLflow blog post on systematic 
+    prompt optimization with GEPA:
+    https://mlflow.org/blog/mlflow-prompt-optimization
+    
+    The prompt is designed to:
+    - Answer questions based ONLY on the provided context
+    - For yes/no questions, answer ONLY "yes" or "no"
+    - NOT include phrases like "based on the context" or "according to the documents"
+    
+    Supports HotPotQA dict format, list of strings, or a single string.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Create a signature with a detailed instruction as the docstring
+        class ContextQASignature(dspy.Signature):
+            """You are a question answering assistant. Answer questions based ONLY on the provided context.
+
+IMPORTANT INSTRUCTIONS:
+- For yes/no questions, answer ONLY "yes" or "no"
+- Do NOT include phrases like "based on the context" or "according to the documents"
+"""
+            context: str = dspy.InputField(desc="The context to use for answering the question")
+            question: str = dspy.InputField(desc="The question to answer")
+            answer: str = dspy.OutputField(desc="The answer to the question")
+        
+        self.answer = dspy.Predict(ContextQASignature)
+
+    def forward(self, question: str, context: dict | list[str] | str = None) -> Prediction:
+        context_str = format_context(context)
+        return self.answer(context=context_str, question=question)
+
+
 class ReasoningContextQA(dspy.Module):
     """Multi-step QA module that uses context with reasoning.
 
@@ -138,6 +174,7 @@ PROGRAMS = {
     "reasoning": ReasoningFirstQA,
     "context": ContextQA,
     "reasoning_context": ReasoningContextQA,
+    "mlflow_base_prompt": MLflowBasePromptContextQA,
 }
 
 
@@ -150,6 +187,7 @@ def create_program(program_type: str = "naive") -> dspy.Module:
             - "reasoning": Two-stage reasoning-first approach
             - "context": Uses provided context to answer questions
             - "reasoning_context": Two-stage reasoning with context
+            - "mlflow_base_prompt": MLflow blog base prompt for HotPotQA (https://mlflow.org/blog/mlflow-prompt-optimization)
 
     Returns:
         A fresh instance of the specified program type.
