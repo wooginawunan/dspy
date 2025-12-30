@@ -451,7 +451,7 @@ def run_benchmark(
         optimized_results and optimized_program are None for baseline runs.
     """
     # Determine if program uses context
-    use_context = args.program in ("context", "reasoning_context", "mlflow_base_prompt")
+    use_context = args.program in ("context", "reasoning_context", "mlflow_base_prompt", "mlflow_v2", "simple_context")
     
     # Load dataset
     train_set, val_set, _ = load_dataset(
@@ -537,7 +537,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Program type: 'naive' (direct QA), 'reasoning' (two-stage reasoning-first), "
             "'context' (uses gold passages), 'reasoning_context' (reasoning with passages), "
-            "'mlflow_base_prompt' (MLflow blog base prompt for HotPotQA)"
+            "'mlflow_base_prompt' (MLflow blog base prompt), 'mlflow_v2' (with_instructions method), "
+            "'simple_context' (minimal signature for GEPA to propose from scratch)"
         ),
     )
 

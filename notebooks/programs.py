@@ -87,36 +87,64 @@ class ContextQA(dspy.Module):
         return self.answer(context=context_str, question=question)
 
 
-class MLflowBasePromptContextQA(dspy.Module):
-    """QA module with a structured base prompt for context-based question answering.
-    
-    This module implements the base prompt from the MLflow blog post on systematic 
-    prompt optimization with GEPA:
-    https://mlflow.org/blog/mlflow-prompt-optimization
-    
-    The prompt is designed to:
-    - Answer questions based ONLY on the provided context
-    - For yes/no questions, answer ONLY "yes" or "no"
-    - NOT include phrases like "based on the context" or "according to the documents"
-    
-    Supports HotPotQA dict format, list of strings, or a single string.
-    """
-
-    def __init__(self):
-        super().__init__()
-        # Create a signature with a detailed instruction as the docstring
-        class ContextQASignature(dspy.Signature):
-            """You are a question answering assistant. Answer questions based ONLY on the provided context.
+# Define signature at module level (Option 1: Module-level class)
+class ContextQASignatureV1(dspy.Signature):
+    """You are a question answering assistant. Answer questions based ONLY on the provided context.
 
 IMPORTANT INSTRUCTIONS:
 - For yes/no questions, answer ONLY "yes" or "no"
 - Do NOT include phrases like "based on the context" or "according to the documents"
 """
-            context: str = dspy.InputField(desc="The context to use for answering the question")
-            question: str = dspy.InputField(desc="The question to answer")
-            answer: str = dspy.OutputField(desc="The answer to the question")
-        
-        self.answer = dspy.Predict(ContextQASignature)
+    context: str = dspy.InputField(desc="The context to use for answering the question")
+    question: str = dspy.InputField(desc="The question to answer")
+    answer: str = dspy.OutputField(desc="The answer to the question")
+
+
+class MLflowBasePromptContextQA(dspy.Module):
+    """QA module with a structured base prompt for context-based question answering.
+    
+    Uses module-level signature class definition.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.answer = dspy.Predict(ContextQASignatureV1)
+
+    def forward(self, question: str, context: dict | list[str] | str = None) -> Prediction:
+        context_str = format_context(context)
+        return self.answer(context=context_str, question=question)
+
+
+# Option 2: Using string signature with .with_instructions()
+class MLflowBasePromptContextQAv2(dspy.Module):
+    """QA module using string signature with .with_instructions() method."""
+
+    INSTRUCTION = """You are a question answering assistant. Answer questions based ONLY on the provided context.
+
+IMPORTANT INSTRUCTIONS:
+- For yes/no questions, answer ONLY "yes" or "no"
+- Do NOT include phrases like "based on the context" or "according to the documents"
+"""
+
+    def __init__(self):
+        super().__init__()
+        # Create signature from string, then add instructions
+        base_sig = dspy.Signature("context, question -> answer")
+        sig_with_instructions = base_sig.with_instructions(self.INSTRUCTION)
+        self.answer = dspy.Predict(sig_with_instructions)
+
+    def forward(self, question: str, context: dict | list[str] | str = None) -> Prediction:
+        context_str = format_context(context)
+        return self.answer(context=context_str, question=question)
+
+
+# Option 3: Simple string signature (let GEPA propose the instruction from scratch)
+class SimpleContextQA(dspy.Module):
+    """QA module with minimal signature - lets GEPA propose instructions from scratch."""
+
+    def __init__(self):
+        super().__init__()
+        self.answer = dspy.Predict("context, question -> answer")
 
     def forward(self, question: str, context: dict | list[str] | str = None) -> Prediction:
         context_str = format_context(context)
@@ -175,6 +203,8 @@ PROGRAMS = {
     "context": ContextQA,
     "reasoning_context": ReasoningContextQA,
     "mlflow_base_prompt": MLflowBasePromptContextQA,
+    "mlflow_v2": MLflowBasePromptContextQAv2,  # Uses .with_instructions()
+    "simple_context": SimpleContextQA,  # Minimal - lets GEPA propose from scratch
 }
 
 
