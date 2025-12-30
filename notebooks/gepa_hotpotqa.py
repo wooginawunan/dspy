@@ -202,11 +202,16 @@ def load_dataset(
 # ============================================================================
 
 
-def setup_model(model_name: str = DEFAULT_MODEL, api_base: str = DEFAULT_API_BASE) -> dspy.LM:
+def setup_model(
+    model_name: str = DEFAULT_MODEL,
+    api_base: str = DEFAULT_API_BASE,
+    disable_cache: bool = False,
+) -> dspy.LM:
     """Configure and return the language model."""
-    lm = dspy.LM(model=model_name, api_base=api_base)
+    lm = dspy.LM(model=model_name, api_base=api_base, cache=not disable_cache)
     dspy.configure(lm=lm)
-    print(f"Model configured: {model_name}")
+    cache_status = "disabled" if disable_cache else "enabled"
+    print(f"Model configured: {model_name} (cache: {cache_status})")
     return lm
 
 
@@ -293,12 +298,13 @@ def optimize_with_gepa(
         model=reflection_model,
         api_base=args.api_base,
         temperature=1.0,
+        max_tokens=4096,  # Ensure enough tokens for instruction generation
     )
 
     optimizer = GEPA(
         metric=hotpotqa_metric_gepa,
         reflection_lm=reflection_lm,
-        max_metric_calls=100,
+        max_metric_calls=50,
         num_threads=args.num_threads,
         track_stats=True,
         reflection_minibatch_size=args.reflection_minibatch_size,
@@ -438,6 +444,62 @@ def _print_comparison_summary(
     print(f"Improvement: {improvement:+.2f} ({pct_improvement:+.1f}% relative)")
 
 
+def _print_gepa_candidates(optimized_program: Module) -> None:
+    """Print all candidate instructions proposed by GEPA during optimization."""
+    if not hasattr(optimized_program, "detailed_results"):
+        print("\nNo detailed_results available. Run GEPA with track_stats=True.")
+        return
+
+    dr = optimized_program.detailed_results
+    
+    _print_section("GEPA CANDIDATE INSPECTION")
+    print(f"Total candidates explored: {len(dr.candidates)}")
+    print(f"Best candidate index: {dr.best_idx}")
+    print(f"Best validation score: {dr.val_aggregate_scores[dr.best_idx]:.4f}")
+    
+    # Print all candidates with their scores
+    print("\n" + "-" * 60)
+    print("ALL PROPOSED CANDIDATES (sorted by score)")
+    print("-" * 60)
+    
+    # Sort candidates by score (descending)
+    scored_candidates = list(enumerate(zip(dr.candidates, dr.val_aggregate_scores)))
+    scored_candidates.sort(key=lambda x: x[1][1], reverse=True)
+    
+    for rank, (idx, (candidate, score)) in enumerate(scored_candidates, 1):
+        best_marker = " ★ BEST" if idx == dr.best_idx else ""
+        print(f"\n[Rank {rank}] Candidate {idx} — Score: {score:.4f}{best_marker}")
+        print("-" * 40)
+        
+        # candidate is a Module, extract predictor instructions
+        for pred_name, pred in candidate.named_predictors():
+            instruction = pred.signature.instructions
+            # Truncate long instructions for display
+            if len(instruction) > 500:
+                display_instr = instruction[:500] + "... [truncated]"
+            else:
+                display_instr = instruction
+            print(f"  [{pred_name}]:")
+            # Indent multiline instructions
+            for line in display_instr.split("\n"):
+                print(f"    {line}")
+    
+    # Print score distribution
+    print("\n" + "-" * 60)
+    print("SCORE DISTRIBUTION")
+    print("-" * 60)
+    scores = dr.val_aggregate_scores
+    print(f"  Min:    {min(scores):.4f}")
+    print(f"  Max:    {max(scores):.4f}")
+    print(f"  Mean:   {sum(scores) / len(scores):.4f}")
+    
+    # Show parent lineage for best candidate
+    if dr.best_idx > 0:
+        print(f"\n  Best candidate lineage: {dr.parents[dr.best_idx]}")
+    
+    print("-" * 60)
+
+
 def run_benchmark(
     args: argparse.Namespace,
 ) -> tuple[Any, Any | None, Module | None]:
@@ -464,7 +526,7 @@ def run_benchmark(
     )
 
     # Setup model and program
-    setup_model(args.model, args.api_base)
+    setup_model(args.model, args.api_base, disable_cache=args.no_cache)
     program = create_program(args.program)
 
     # Evaluate baseline
@@ -489,6 +551,10 @@ def run_benchmark(
 
     # Show prompt changes
     _print_prompt_comparison(program, optimized_program)
+
+    # Show GEPA candidate details if available
+    if args.optimizer == "gepa" and hasattr(optimized_program, "detailed_results"):
+        _print_gepa_candidates(optimized_program)
 
     # Evaluate optimized program
     _print_section("OPTIMIZED EVALUATION")
@@ -526,6 +592,7 @@ def parse_args() -> argparse.Namespace:
     model_group = parser.add_argument_group("Model")
     model_group.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Model name")
     model_group.add_argument("--api_base", type=str, default=DEFAULT_API_BASE, help="API base URL")
+    model_group.add_argument("--no_cache", action="store_true", help="Disable LM response caching")
 
     # Program arguments
     program_group = parser.add_argument_group("Program")
