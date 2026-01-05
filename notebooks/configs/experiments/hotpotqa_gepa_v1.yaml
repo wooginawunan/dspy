@@ -1,0 +1,41 @@
+name: hotpotqa_gepa_v1
+description: HotPotQA optimization using GEPA with context-aware QA
+
+dataset:
+  name: hotpotqa
+  train_size: 100
+  dev_size: 20
+  test_size: 0
+  train_seed: 1
+  eval_seed: 2023
+  keep_details: true
+  params:
+    use_context: true
+
+model:
+  name: ollama_chat/qwen3:4b-instruct
+  api_base: http://localhost:11434
+  cache: true
+  params: {}
+
+optimizer:
+  name: gepa
+  auto: light
+  num_threads: 1
+  params:
+    reflection_lm: null  # Uses same model as main LM if null
+    reflection_minibatch_size: 1  # Reduced for local model
+    max_metric_calls: 200  # Much higher for comprehensive optimization
+    track_stats: true
+
+program:
+  name: mlflow_base_prompt
+  params: {}
+
+logging:
+  level: INFO
+  log_to_file: true
+  log_dir: results/logs
+  include_timestamps: true
+  save_models: true
+  model_dir: results/models
