@@ -108,6 +108,13 @@ class ExperimentConfig:
 def load_config(config_path: str | Path) -> ExperimentConfig:
     """Load experiment configuration from YAML file.
     
+    Supports modular configs via references:
+    - dataset_ref: references configs/datasets/<name>.yaml
+    - model_ref: references configs/models/<name>.yaml
+    - optimizer_ref: references configs/optimizers/<name>.yaml
+    - program_ref: references configs/programs/<name>.yaml
+    - logging_ref: references configs/base/<name>.yaml
+    
     Args:
         config_path: Path to the configuration file.
         
@@ -128,6 +135,9 @@ def load_config(config_path: str | Path) -> ExperimentConfig:
     if not isinstance(config_dict, dict):
         raise ValueError("Config file must contain a YAML dictionary")
     
+    # Resolve references to modular configs
+    config_dict = _resolve_references(config_dict, config_path)
+    
     return _parse_config_dict(config_dict)
 
 
@@ -145,6 +155,81 @@ def save_config(config: ExperimentConfig, config_path: str | Path) -> None:
     
     with open(config_path, 'w') as f:
         yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+
+
+def _resolve_references(config_dict: dict[str, Any], config_path: Path) -> dict[str, Any]:
+    """Resolve modular config references.
+    
+    Args:
+        config_dict: The experiment config dictionary.
+        config_path: Path to the main config file (used to find config root).
+        
+    Returns:
+        Config dictionary with references resolved and merged.
+    """
+    # Find config root (go up from experiments/ to configs/)
+    config_root = config_path.parent.parent
+    
+    # Map of reference keys to their subdirectories
+    ref_map = {
+        'dataset_ref': 'datasets',
+        'model_ref': 'models',
+        'optimizer_ref': 'optimizers',
+        'program_ref': 'programs',
+        'logging_ref': 'base'
+    }
+    
+    resolved = config_dict.copy()
+    
+    for ref_key, subdir in ref_map.items():
+        if ref_key in config_dict:
+            ref_name = config_dict[ref_key]
+            ref_path = config_root / subdir / f"{ref_name}.yaml"
+            
+            if not ref_path.exists():
+                raise FileNotFoundError(f"Referenced config not found: {ref_path}")
+            
+            with open(ref_path) as f:
+                ref_config = yaml.safe_load(f)
+            
+            # Determine the target key (remove _ref suffix)
+            target_key = ref_key.replace('_ref', '')
+            
+            # Merge: referenced config as base, then apply overrides
+            override_key = f"{target_key}_overrides"
+            if override_key in config_dict:
+                # Deep merge overrides
+                merged = _deep_merge(ref_config, config_dict[override_key])
+                resolved[target_key] = merged
+            else:
+                resolved[target_key] = ref_config
+            
+            # Remove the reference and override keys
+            resolved.pop(ref_key, None)
+            resolved.pop(override_key, None)
+    
+    return resolved
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Deep merge two dictionaries.
+    
+    Args:
+        base: Base dictionary.
+        override: Override dictionary (takes precedence).
+        
+    Returns:
+        Merged dictionary.
+    """
+    result = base.copy()
+    
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    
+    return result
 
 
 def _parse_config_dict(config_dict: dict[str, Any]) -> ExperimentConfig:
