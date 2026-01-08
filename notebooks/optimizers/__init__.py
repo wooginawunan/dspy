@@ -9,13 +9,15 @@ from .mipro import MiproAdapter
 from .bootstrap import BootstrapAdapter
 from .copro import CoproAdapter
 from .baseline import BaselineAdapter
+from .sbo import SBOAdapter
 
 __all__ = [
     "OptimizerAdapter",
     "OptimizerRegistry",
-    "GepaAdapter", 
+    "GepaAdapter",
     "MiproAdapter",
     "BootstrapAdapter",
     "CoproAdapter",
     "BaselineAdapter",
+    "SBOAdapter",
 ]
