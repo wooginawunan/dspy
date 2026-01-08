@@ -194,12 +194,15 @@ class SemanticBundleOptimization(Teleprompter):
             )
 
             logger.info(f"\nGenerated {len(candidates)} candidate programs")
-            # Log first few candidates to see what was generated
-            for i, candidate in enumerate(candidates[:3]):  # Show first 3
+            # Log all candidates to see what was generated
+            for i, candidate in enumerate(candidates):
                 cand_prompts = self._extract_prompts(candidate)
                 logger.info(f"  Candidate {i+1} prompts:")
                 for pred_name, prompt_text in cand_prompts.items():
-                    logger.info(f"    [{pred_name}]: {repr(prompt_text)[:150]}")
+                    logger.info(f"    [{pred_name}]: {repr(prompt_text)[:200]}")
+                    # Check if this candidate is different from center
+                    if prompt_text == bundle[center_idx].prompt.get(pred_name):
+                        logger.warning(f"    ⚠ Candidate {i+1} [{pred_name}] is IDENTICAL to center!")
 
             # Stage 2: Filter candidates (Verifier)
             best_candidate, best_candidate_prompts = self._select_best_candidate(
@@ -222,12 +225,20 @@ class SemanticBundleOptimization(Teleprompter):
             predicted_improvement = bundle[center_idx].loss - model_value
             actual_improvement = bundle[center_idx].loss - candidate_loss
 
-            logger.info(f"\nPredicted improvement: {predicted_improvement:.4f}")
-            logger.info(f"Actual improvement: {actual_improvement:.4f}")
-            logger.info(f"Candidate loss: {candidate_loss:.4f}")
+            logger.info(f"\n{'='*60}")
+            logger.info(f"ITERATION {iteration} RESULTS:")
+            logger.info(f"  Center loss:           {bundle[center_idx].loss:.4f}")
+            logger.info(f"  Candidate loss:        {candidate_loss:.4f}")
+            logger.info(f"  Model value:           {model_value:.4f}")
+            logger.info(f"  Predicted improvement: {predicted_improvement:.4f}")
+            logger.info(f"  Actual improvement:    {actual_improvement:.4f}")
             logger.info(f"\nBest candidate selected:")
             for pred_name, prompt_text in best_candidate_prompts.items():
-                logger.info(f"  [{pred_name}]: {repr(prompt_text)[:200]}")
+                # Check if changed
+                is_same = (prompt_text == bundle[center_idx].prompt.get(pred_name, ""))
+                status = "[UNCHANGED]" if is_same else "[MODIFIED]"
+                logger.info(f"  [{pred_name}] {status}: {repr(prompt_text)[:200]}")
+            logger.info(f"{'='*60}\n")
 
             # Descent test: Serious vs Null step
             if actual_improvement >= self.descent_param * predicted_improvement:
@@ -289,8 +300,10 @@ class SemanticBundleOptimization(Teleprompter):
                 logger.info(f"Terminating: {self.max_null_steps} consecutive null steps")
                 break
 
-            if predicted_improvement <= 0:
-                logger.info("Terminating: Non-positive predicted improvement")
+            # Only terminate on non-positive predicted improvement after a few iterations
+            # This gives the optimizer time to build a useful bundle
+            if iteration >= 3 and predicted_improvement <= 0:
+                logger.info("Terminating: Non-positive predicted improvement (after iteration 3+)")
                 break
 
         # Return best program from bundle
@@ -332,23 +345,33 @@ class SemanticBundleOptimization(Teleprompter):
             for name, pred in program.named_predictors():
                 if name == pred_name:
                     if hasattr(pred, 'signature'):
-                        pred.signature = pred.signature.with_instructions(instruction)
+                        # IMPORTANT: with_instructions() returns a NEW signature, must reassign!
+                        new_signature = pred.signature.with_instructions(instruction)
+                        pred.signature = new_signature
+                        logger.debug(f"Applied instruction to {pred_name}: {repr(instruction)[:100]}")
         return program
 
     def _evaluate_program(self, program: Module, examples: list[Example]) -> float:
         """Evaluate program on examples using the metric (robust loss estimation)."""
         total_loss = 0.0
-        for ex in examples:
+        logger.info(f"Evaluating program on {len(examples)} examples...")
+        for idx, ex in enumerate(examples):
             try:
+                logger.debug(f"  Example {idx+1}/{len(examples)}: Running program...")
                 pred = program(**ex.inputs())
+                logger.debug(f"  Example {idx+1}/{len(examples)}: Computing metric...")
                 score = self.metric(ex, pred, None)
                 # Convert score to loss (assuming metric returns [0,1] with 1=best)
                 loss = 1.0 - float(score)
                 total_loss += loss
+                logger.debug(f"  Example {idx+1}/{len(examples)}: score={score:.3f}, loss={loss:.3f}")
             except Exception as e:
-                logger.warning(f"Evaluation error: {e}")
+                logger.warning(f"Evaluation error on example {idx+1}: {e}")
+                logger.debug(f"  Example inputs: {ex.inputs()}")
                 total_loss += 1.0  # Max penalty
-        return total_loss / len(examples)
+        avg_loss = total_loss / len(examples)
+        logger.info(f"Program evaluation complete: avg_loss={avg_loss:.4f}")
+        return avg_loss
 
     def _generate_critique(
         self,
@@ -411,7 +434,7 @@ Critique:"""
         examples: list[Example],
         prompts: dict[str, str],
         target_loss: float,
-        lm: LM
+        critic_lm: LM
     ) -> str:
         """Generate critique explaining why a candidate failed to improve."""
         current_loss = self._evaluate_program(program, examples)
@@ -431,8 +454,8 @@ Analyze why this candidate failed to improve performance. Provide a specific, ac
 
 Critique:"""
 
-        with dspy.context(lm=lm, temperature=self.temperature):
-            response = lm(critique_prompt)
+        with dspy.context(lm=critic_lm, temperature=self.temperature):
+            response = critic_lm(critique_prompt)
 
         # LM returns a list of completions, get the first one
         return (response[0] if isinstance(response, list) else response).strip()
@@ -459,7 +482,15 @@ Constraints:
 2. Focus: Address the critique directly
 3. Diversity: Generate {self.num_candidates} distinct variations
 
-Output: Return exactly {self.num_candidates} candidate prompts, each on a new line starting with "CANDIDATE N:".
+Output Format: Return exactly {self.num_candidates} candidate prompts. Each candidate should start with "CANDIDATE N:" on its own line, followed by the improved prompt text.
+
+Example format:
+CANDIDATE 1:
+Your first improved prompt text here
+CANDIDATE 2:
+Your second improved prompt text here
+CANDIDATE 3:
+Your third improved prompt text here
 
 Candidates:"""
 
@@ -474,31 +505,47 @@ Candidates:"""
         logger.info(f"{response_text[:500]}")
         logger.info(f"{'='*60}\n")
 
-        # Parse candidates
+        # Parse candidates - improved parsing to handle various LM response formats
         candidates = []
-        lines = response_text.strip().split('\n')
-        current_candidate = []
+        
+        # Try splitting by "CANDIDATE" keyword first
+        parts = response_text.split('CANDIDATE')
+        
+        for i, part in enumerate(parts):
+            if i == 0 and not part.strip():
+                continue  # Skip empty first part
+            
+            # Remove the candidate number/marker (e.g., "1:", "2:", etc.)
+            lines = part.strip().split('\n')
+            if lines:
+                # Remove first line if it's just a number/colon
+                first_line = lines[0].strip()
+                if first_line and (first_line[0].isdigit() or first_line.startswith(':')):
+                    # Check if there's actual text after the number
+                    colon_idx = first_line.find(':')
+                    if colon_idx >= 0 and len(first_line) > colon_idx + 1:
+                        # Text on same line as "CANDIDATE N:"
+                        lines[0] = first_line[colon_idx + 1:].strip()
+                    else:
+                        # Number/colon only, skip this line
+                        lines = lines[1:]
+            
+            candidate_text = '\n'.join(lines).strip()
+            
+            # Only add if we have non-empty text
+            if candidate_text:
+                logger.info(f"Parsed candidate {len(candidates)+1}: {repr(candidate_text[:100])}")
+                new_prompts = {k: candidate_text for k in center_prompts.keys()}
+                candidates.append(self._build_program_from_prompts(center_program, new_prompts))
 
-        for line in lines:
-            if line.strip().startswith('CANDIDATE'):
-                if current_candidate:
-                    candidate_text = '\n'.join(current_candidate).strip()
-                    # Create program with this prompt
-                    # For simplicity, apply to all predictors (can be more sophisticated)
-                    new_prompts = {k: candidate_text for k in center_prompts.keys()}
-                    candidates.append(self._build_program_from_prompts(center_program, new_prompts))
-                current_candidate = []
-            else:
-                current_candidate.append(line)
-
-        # Don't forget last candidate
-        if current_candidate:
-            candidate_text = '\n'.join(current_candidate).strip()
-            new_prompts = {k: candidate_text for k in center_prompts.keys()}
-            candidates.append(self._build_program_from_prompts(center_program, new_prompts))
-
-        # Ensure we have enough candidates
+        # If parsing failed completely, try to extract at least some variations
+        if len(candidates) == 0:
+            logger.warning("Failed to parse any candidates from LM response, using center program")
+            candidates.append(center_program.deepcopy())
+        
+        # Fill remaining slots with center program copies if needed
         while len(candidates) < self.num_candidates:
+            logger.warning(f"Only parsed {len(candidates)} candidates, padding with center program")
             candidates.append(center_program.deepcopy())
 
         return candidates[:self.num_candidates]
@@ -583,6 +630,7 @@ Score:"""
         """
         logger.info(f"\n{'='*60}")
         logger.info(f"VERIFIER: Evaluating {len(candidates)} candidates against bundle of {len(bundle)}")
+        logger.info(f"  (This requires {len(candidates) * len(bundle) * self.num_judge_samples} judge LM calls)")
         logger.info(f"{'='*60}")
 
         best_violation = float('inf')
