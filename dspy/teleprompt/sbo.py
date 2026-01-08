@@ -379,7 +379,8 @@ Critique:"""
         with dspy.context(lm=lm, temperature=self.temperature):
             response = lm(critique_prompt)
 
-        return response.strip()
+        # LM returns a list of completions, get the first one
+        return (response[0] if isinstance(response, list) else response).strip()
 
     def _generate_failure_critique(
         self,
@@ -410,7 +411,8 @@ Critique:"""
         with dspy.context(lm=lm, temperature=self.temperature):
             response = lm(critique_prompt)
 
-        return response.strip()
+        # LM returns a list of completions, get the first one
+        return (response[0] if isinstance(response, list) else response).strip()
 
     def _generate_candidates(
         self,
@@ -441,9 +443,12 @@ Candidates:"""
         with dspy.context(lm=lm, temperature=self.temperature):
             response = lm(proposer_prompt)
 
+        # LM returns a list of completions, get the first one
+        response_text = response[0] if isinstance(response, list) else response
+
         # Parse candidates
         candidates = []
-        lines = response.strip().split('\n')
+        lines = response_text.strip().split('\n')
         current_candidate = []
 
         for line in lines:
@@ -523,14 +528,17 @@ Output ONLY a single number between -1.0 and 1.0. No explanation.
 Score:"""
 
         with dspy.context(lm=lm, temperature=0.0):  # Deterministic
-            response = lm(judge_prompt).strip()
+            response = lm(judge_prompt)
+
+        # LM returns a list of completions, get the first one
+        response_text = (response[0] if isinstance(response, list) else response).strip()
 
         # Parse score
         try:
-            score = float(response)
+            score = float(response_text)
             return max(-1.0, min(1.0, score))
         except:
-            logger.warning(f"Failed to parse judge score: {response}")
+            logger.warning(f"Failed to parse judge score: {response_text}")
             return 0.0
 
     def _select_best_candidate(
