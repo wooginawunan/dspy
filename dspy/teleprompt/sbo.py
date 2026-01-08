@@ -147,8 +147,19 @@ class SemanticBundleOptimization(Teleprompter):
 
         # Initialize bundle with original program
         original_prompts = self._extract_prompts(student)
+        logger.info(f"\n{'='*60}")
+        logger.info(f"INITIAL PROMPTS EXTRACTED:")
+        for pred_name, prompt_text in original_prompts.items():
+            logger.info(f"  [{pred_name}]: {repr(prompt_text)[:200]}")
+        logger.info(f"{'='*60}\n")
+
         original_loss = self._evaluate_program(student, valset)
+        logger.info(f"Original loss on valset: {original_loss:.4f}")
+
         initial_critique = self._generate_critique(student, trainset, original_prompts, critic_lm)
+        logger.info(f"\nINITIAL CRITIQUE:")
+        logger.info(f"  {initial_critique[:500]}")
+        logger.info(f"")
 
         bundle = [BundleEntry(
             prompt=original_prompts,
@@ -173,13 +184,22 @@ class SemanticBundleOptimization(Teleprompter):
             logger.info(f"{'='*60}")
 
             # Stage 1: Generate candidates (Proposer)
+            logger.info(f"\nCurrent critique for candidate generation:")
+            logger.info(f"  {bundle[center_idx].critique[:300]}...")
+
             candidates = self._generate_candidates(
                 center_program,
                 bundle[center_idx].critique,
                 proposer_lm
             )
 
-            logger.info(f"Generated {len(candidates)} candidate programs")
+            logger.info(f"\nGenerated {len(candidates)} candidate programs")
+            # Log first few candidates to see what was generated
+            for i, candidate in enumerate(candidates[:3]):  # Show first 3
+                cand_prompts = self._extract_prompts(candidate)
+                logger.info(f"  Candidate {i+1} prompts:")
+                for pred_name, prompt_text in cand_prompts.items():
+                    logger.info(f"    [{pred_name}]: {repr(prompt_text)[:150]}")
 
             # Stage 2: Filter candidates (Verifier)
             best_candidate, best_candidate_prompts = self._select_best_candidate(
@@ -202,9 +222,12 @@ class SemanticBundleOptimization(Teleprompter):
             predicted_improvement = bundle[center_idx].loss - model_value
             actual_improvement = bundle[center_idx].loss - candidate_loss
 
-            logger.info(f"Predicted improvement: {predicted_improvement:.4f}")
+            logger.info(f"\nPredicted improvement: {predicted_improvement:.4f}")
             logger.info(f"Actual improvement: {actual_improvement:.4f}")
             logger.info(f"Candidate loss: {candidate_loss:.4f}")
+            logger.info(f"\nBest candidate selected:")
+            for pred_name, prompt_text in best_candidate_prompts.items():
+                logger.info(f"  [{pred_name}]: {repr(prompt_text)[:200]}")
 
             # Descent test: Serious vs Null step
             if actual_improvement >= self.descent_param * predicted_improvement:
@@ -446,6 +469,11 @@ Candidates:"""
         # LM returns a list of completions, get the first one
         response_text = response[0] if isinstance(response, list) else response
 
+        logger.info(f"\n{'='*60}")
+        logger.info(f"PROPOSER RAW RESPONSE (first 500 chars):")
+        logger.info(f"{response_text[:500]}")
+        logger.info(f"{'='*60}\n")
+
         # Parse candidates
         candidates = []
         lines = response_text.strip().split('\n')
@@ -553,15 +581,20 @@ Score:"""
 
         Returns: (best_program, best_prompts)
         """
+        logger.info(f"\n{'='*60}")
+        logger.info(f"VERIFIER: Evaluating {len(candidates)} candidates against bundle of {len(bundle)}")
+        logger.info(f"{'='*60}")
+
         best_violation = float('inf')
         best_candidate = candidates[0]
         best_prompts = self._extract_prompts(candidates[0])
 
-        for candidate in candidates:
+        for idx, candidate in enumerate(candidates):
             candidate_prompts = self._extract_prompts(candidate)
 
             # Compute cumulative violation against all bundle entries
             total_violation = 0.0
+            scores_detail = []
             for entry in bundle:
                 score = self._compute_semantic_score(
                     candidate_prompts,
@@ -572,13 +605,19 @@ Score:"""
                 # Hinge loss: max(0, τ - score)
                 violation = max(0, self.tau_margin - score)
                 total_violation += violation
+                scores_detail.append((score, violation))
+
+            logger.info(f"  Candidate {idx+1}: total_violation={total_violation:.4f}")
+            for i, (score, viol) in enumerate(scores_detail):
+                logger.info(f"    vs bundle[{i}]: score={score:.3f}, violation={viol:.3f}")
 
             if total_violation < best_violation:
                 best_violation = total_violation
                 best_candidate = candidate
                 best_prompts = candidate_prompts
 
-        logger.info(f"Best candidate violation: {best_violation:.4f}")
+        logger.info(f"\n✓ Selected candidate with violation: {best_violation:.4f}")
+        logger.info(f"{'='*60}\n")
         return best_candidate, best_prompts
 
     def _compute_model_value(
