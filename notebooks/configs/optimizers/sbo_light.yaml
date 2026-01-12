@@ -3,9 +3,9 @@ auto: light
 num_threads: 1
 params:
   # LM configurations (null = use main model)
-  judge_lm: null
-  proposer_lm: null
-  critic_lm: null
+  judge_lm: ollama_chat/qwen3:4b-instruct
+  proposer_lm: ollama_chat/qwen3:4b-instruct
+  critic_lm: ollama_chat/qwen3:4b-instruct
 
   # Core SBO parameters (lighter settings for faster iteration)
   num_candidates: 3  # Fewer candidates

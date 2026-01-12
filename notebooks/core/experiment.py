@@ -4,7 +4,7 @@ Main experiment runner for prompt optimization.
 
 from __future__ import annotations
 
-import pickle
+import json
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -19,6 +19,12 @@ from programs.registry import ProgramRegistry
 
 if TYPE_CHECKING:
     from dspy import Module
+
+# Try to import cloudpickle, fall back to pickle if not available
+try:
+    import cloudpickle as pickle
+except ImportError:
+    import pickle
 
 
 class ExperimentRunner:
@@ -281,19 +287,52 @@ class ExperimentRunner:
         self.logger.logger.info("-" * 60)
     
     def _save_optimized_program(self, program: Module) -> str:
-        """Save optimized program to disk."""
+        """Save optimized program to disk.
+        
+        Saves both the full program (with cloudpickle) and a JSON file 
+        with the optimized prompts for easy inspection.
+        """
         model_dir = Path(self.config.logging.model_dir)
         model_dir.mkdir(parents=True, exist_ok=True)
         
         timestamp = self.logger.results["start_time"].replace(":", "-").replace(".", "-")
         model_path = model_dir / f"{self.config.name}_{timestamp}.pkl"
+        prompts_path = model_dir / f"{self.config.name}_{timestamp}_prompts.json"
         
+        # Always save the optimized prompts as JSON (most important!)
+        try:
+            prompts_data = {
+                "experiment": self.config.name,
+                "timestamp": self.logger.results["start_time"],
+                "predictors": {}
+            }
+            
+            for name, pred in program.named_predictors():
+                try:
+                    prompts_data["predictors"][name] = {
+                        "signature": str(pred.signature),
+                        "instructions": pred.signature.instructions,
+                        "input_fields": list(pred.signature.input_fields.keys()),
+                        "output_fields": list(pred.signature.output_fields.keys())
+                    }
+                except Exception as e:
+                    prompts_data["predictors"][name] = {"error": str(e)}
+            
+            with open(prompts_path, 'w') as f:
+                json.dump(prompts_data, f, indent=2)
+            
+            self.logger.logger.info(f"Optimized prompts saved to: {prompts_path}")
+        except Exception as e:
+            self.logger.logger.warning(f"Could not save prompts JSON: {e}")
+        
+        # Try to save the full program with cloudpickle (handles dynamic classes better)
         try:
             with open(model_path, 'wb') as f:
                 pickle.dump(program, f)
+            self.logger.logger.info(f"Full program saved with cloudpickle to: {model_path}")
         except Exception as e:
-            self.logger.logger.warning(f"Could not pickle optimized program: {e}")
-            # Try saving just the state dict or instructions
+            # If cloudpickle fails, save program state dict as fallback
+            self.logger.logger.info(f"Saving program state dict (full pickle failed: {e})")
             try:
                 program_state = {
                     "predictors": {},

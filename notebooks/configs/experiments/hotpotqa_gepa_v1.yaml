@@ -5,7 +5,7 @@ description: HotPotQA optimization using GEPA with context-aware QA
 dataset_ref: hotpotqa_standard
 model_ref: qwen3_4b
 optimizer_ref: gepa
-program_ref: mlflow_base
+program_ref: naive
 logging_ref: logging
 
 # Override only what's different from the baseline
