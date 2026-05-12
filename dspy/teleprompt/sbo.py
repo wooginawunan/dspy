@@ -43,7 +43,7 @@ class SBOResult:
     num_serious_steps: int
     num_null_steps: int
 
-
+#Nan: scoring only based on prompt without context maybe not be appropriate?
 class JudgeSemanticAlignment(dspy.Signature):
     """Quantify how well a Candidate Prompt addresses the Critique relative to the Reference Prompt.
 
@@ -202,18 +202,27 @@ class SemanticBundleOptimization(Teleprompter):
         self.result: Optional[SBOResult] = None
 
     def _format_example_fields(self, value: Example | Prediction | Any) -> str:
-        """Render the fields of a DSPy Example/Prediction as 'key: value' lines.
+        """Render the fields of a DSPy Example/Prediction for a failure block.
 
         Trusts the DSPy data structure to expose the right fields:
         - `ex.inputs()` already isolates the program's input fields.
         - `ex.labels()` already isolates the gold-output fields.
         - `Prediction.items()` already reflects the program signature's outputs.
+
+        Single-field dicts drop the `key:` prefix because the surrounding
+        `Input:` / `Expected:` / `Predicted:` label in the failure block
+        already identifies the slot — repeating `question:` / `answer:` is
+        noise that distracts small critic LMs. Multi-field dicts keep the
+        per-field prefixes so the structure remains parseable.
         """
         if hasattr(value, "items"):
             try:
-                return "\n".join(f"{key}: {field}" for key, field in value.items())
+                items = list(value.items())
             except Exception:
                 return str(value)
+            if len(items) == 1:
+                return str(items[0][1])
+            return "\n".join(f"{key}: {field}" for key, field in items)
         return str(value)
 
     def compile(
@@ -302,6 +311,7 @@ class SemanticBundleOptimization(Teleprompter):
                 logger.info(f"  Candidate {i+1}: {candidate_instruction!r}")
                 if candidate_instruction == center_instruction:
                     logger.warning(f"    ⚠ Candidate {i+1} is IDENTICAL to center!")
+                    # TODO: add a check to see if the candidate is actually different from the center. Should we drop it?
 
             # Stage 2: Filter candidates (Verifier)
             best_candidate, best_candidate_instruction = self._select_best_candidate(
@@ -443,6 +453,11 @@ class SemanticBundleOptimization(Teleprompter):
         """Return the single instruction SBO will optimize for this program.
 
         SBO optimizes one instruction string and broadcasts it to every predictor.
+        Returns the *normalized* semantic instruction: DSPy auto-synthesized
+        scaffolds (e.g. "Given the fields `x`, produce the fields `y`.") are
+        collapsed to "" so downstream consumers (proposer, critic, judge) all
+        agree on what "no task instruction set" means.
+
         If the program has multiple predictors with divergent task instructions,
         raise — there is no single instruction to optimize. Use a per-predictor
         optimizer (COPRO / MIPRO / GEPA) for that case.
@@ -450,15 +465,14 @@ class SemanticBundleOptimization(Teleprompter):
         instructions: list[str] = []
         for _, pred in program.named_predictors():
             if hasattr(pred, "signature") and hasattr(pred.signature, "instructions"):
-                instructions.append(pred.signature.instructions or "")
+                instructions.append(
+                    self._normalize_instruction_text(pred.signature.instructions or "")
+                )
 
         if not instructions:
             return ""
 
-        distinct_semantic = {
-            self._normalize_instruction_text(text) for text in instructions
-        }
-        if len(distinct_semantic) > 1:
+        if len(set(instructions)) > 1:
             raise ValueError(
                 "SBO optimizes a single instruction shared across all predictors, "
                 "but this program has predictors with divergent task instructions. "
@@ -558,7 +572,17 @@ class SemanticBundleOptimization(Teleprompter):
         sample_size: int = 3,
         score_threshold: float = 0.8,
     ) -> list[dict[str, Any]]:
-        """Run `program` on a small sample and collect cases that score below threshold."""
+        """Run `program` on a small sample and collect cases that score below threshold.
+
+        `Example.labels()` returns every non-input field on the example — which
+        for datasets like HotPotQA includes large metadata fields (`context`,
+        `gold_titles`, `id`, `type`) the program never sees or emits. Feeding
+        those into the critic balloons the prompt and distracts the LM with
+        irrelevant content. Scope `expected` strictly to the program signature's
+        output fields so the critic only reasons about what the program is
+        actually being asked to produce.
+        """
+        output_field_names = self._collect_output_field_names(program)
         failures: list[dict[str, Any]] = []
         for ex in random.sample(examples, min(sample_size, len(examples))):
             try:
@@ -567,13 +591,30 @@ class SemanticBundleOptimization(Teleprompter):
             except Exception:
                 continue
             if score < score_threshold:
+                expected_fields = {
+                    key: value
+                    for key, value in ex.labels().items()
+                    if not output_field_names or key in output_field_names
+                }
                 failures.append({
                     "input": self._format_example_fields(ex.inputs()),
-                    "expected": self._format_example_fields(ex.labels()),
+                    "expected": self._format_example_fields(expected_fields),
                     "predicted": self._format_example_fields(pred),
                     "score": float(score),
                 })
         return failures
+
+    def _collect_output_field_names(self, program: Module) -> set[str]:
+        """Union of output-field names declared by every predictor in `program`.
+
+        Used to filter dataset Examples down to fields the program signature
+        actually emits, so failure blocks don't include dataset-only metadata.
+        """
+        names: set[str] = set()
+        for _, pred in program.named_predictors():
+            if hasattr(pred, "signature") and hasattr(pred.signature, "output_fields"):
+                names.update(pred.signature.output_fields.keys())
+        return names
 
     def _format_failures(self, failures: list[dict[str, Any]]) -> str:
         """Render failure dicts as the block consumed by critique modules."""
@@ -599,6 +640,8 @@ class SemanticBundleOptimization(Teleprompter):
         failures_text = self._format_failures(failures)
 
         with dspy.context(lm=lm, temperature=self.temperature):
+            logger.info(f"Critique generation - current instruction: {instruction}")
+            logger.info(f"Critique generation - sampled failures: {failures_text}")
             try:
                 result = self._critique(
                     current_prompt=instruction,
@@ -650,10 +693,9 @@ class SemanticBundleOptimization(Teleprompter):
     ) -> list[Module]:
         """Generate N candidate variations addressing the critique (Proposer)."""
         center_instruction = self._extract_instruction(center_program)
-        normalized_instruction = self._normalize_instruction_text(center_instruction)
         logger.info(f"Center instruction: {center_instruction!r}")
 
-        prompt_text = normalized_instruction or "(no task-specific instruction currently set)"
+        prompt_text = center_instruction or "(no task-specific instruction currently set)"
 
         try:
             with dspy.context(lm=lm, temperature=self.temperature):

@@ -84,7 +84,8 @@ def sbo() -> SemanticBundleOptimization:
 
 
 def test_naive_qa_inputs_render_only_input_fields(sbo):
-    """`question -> answer` signature: inputs() should render just 'question'."""
+    """`question -> answer` signature: inputs() has one field, so the
+    `question:` prefix is dropped — the outer failure-block label identifies it."""
     ex = Example(
         question="What is the capital of France?",
         answer="Paris",
@@ -92,11 +93,12 @@ def test_naive_qa_inputs_render_only_input_fields(sbo):
 
     rendered = sbo._format_example_fields(ex.inputs())
 
-    assert rendered == "question: What is the capital of France?"
+    assert rendered == "What is the capital of France?"
     assert "answer" not in rendered, "labels must not leak into inputs rendering"
 
 
 def test_naive_qa_labels_render_only_label_fields(sbo):
+    """Single-field labels: drop the `answer:` prefix for the same reason as inputs."""
     ex = Example(
         question="What is the capital of France?",
         answer="Paris",
@@ -104,7 +106,7 @@ def test_naive_qa_labels_render_only_label_fields(sbo):
 
     rendered = sbo._format_example_fields(ex.labels())
 
-    assert rendered == "answer: Paris"
+    assert rendered == "Paris"
     assert "question" not in rendered, "inputs must not leak into labels rendering"
 
 
@@ -138,7 +140,10 @@ def test_hotpotqa_style_labels_include_gold_titles(sbo):
 
 
 def test_math_signature_uses_problem_not_question(sbo):
-    """`problem -> answer` (MathNaive) must work without any hardcoded key list."""
+    """`problem -> answer` (MathNaive) must work without any hardcoded key list.
+
+    Both sides are single-field, so neither carries a `problem:` / `answer:` prefix.
+    """
     ex = Example(
         problem="What is 2 + 2?",
         answer="4",
@@ -147,8 +152,8 @@ def test_math_signature_uses_problem_not_question(sbo):
     inputs_rendered = sbo._format_example_fields(ex.inputs())
     labels_rendered = sbo._format_example_fields(ex.labels())
 
-    assert inputs_rendered == "problem: What is 2 + 2?"
-    assert labels_rendered == "answer: 4"
+    assert inputs_rendered == "What is 2 + 2?"
+    assert labels_rendered == "4"
 
 
 # ---------------------------------------------------------------------------
@@ -170,12 +175,32 @@ def test_prediction_renders_all_output_fields(sbo):
 
 
 def test_prediction_with_single_field(sbo):
-    """NaiveQA predictions have just one output field."""
+    """NaiveQA predictions have just one output field — prefix is dropped."""
     pred = Prediction(answer="Paris")
 
     rendered = sbo._format_example_fields(pred)
 
-    assert rendered == "answer: Paris"
+    assert rendered == "Paris"
+
+
+def test_single_field_drops_prefix_but_multi_field_keeps_prefixes(sbo):
+    """Single vs multi-field rendering produces different shapes intentionally:
+
+    Single-field: bare value (the outer Input/Expected/Predicted label is
+    enough; repeating the field name is redundant noise that confuses small
+    critic LMs).
+
+    Multi-field: `key: value\\n...` so the structure is still parseable.
+    """
+    single = Prediction(answer="Paris")
+    multi = Prediction(reasoning="It was founded in 987 AD.", answer="Paris")
+
+    assert sbo._format_example_fields(single) == "Paris"
+
+    multi_rendered = sbo._format_example_fields(multi)
+    assert "reasoning: It was founded in 987 AD." in multi_rendered
+    assert "answer: Paris" in multi_rendered
+    assert ":" in multi_rendered, "multi-field rendering keeps `key:` prefixes"
 
 
 # ---------------------------------------------------------------------------
@@ -222,11 +247,12 @@ def test_empty_example_renders_empty_string(sbo):
 
 
 def test_short_text_passes_through_unchanged(sbo):
+    """Single-field input renders the bare value with no truncation marker."""
     ex = Example(question="short").with_inputs("question")
 
     rendered = sbo._format_example_fields(ex.inputs())
 
-    assert rendered == "question: short"
+    assert rendered == "short"
     assert not rendered.endswith("...")
 
 
@@ -279,9 +305,9 @@ def test_critique_failure_block_shape(sbo):
         "score": 0.0,
     }
 
-    assert failure["input"] == "question: What is the capital of France?"
-    assert failure["expected"] == "answer: Paris"
-    assert failure["predicted"] == "answer: Lyon"
+    assert failure["input"] == "What is the capital of France?"
+    assert failure["expected"] == "Paris"
+    assert failure["predicted"] == "Lyon"
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +346,44 @@ def test_build_program_does_not_mutate_template(sbo):
     program = _SingleSlotProgram(instruction="Original.")
     _ = sbo._build_program(program, "Rebuilt.")
     assert sbo._extract_instruction(program) == "Original."
+
+
+def test_extract_instruction_normalizes_scaffold_to_empty(sbo):
+    """An empty-instruction program reports `""`, not the DSPy auto-scaffold.
+
+    `NaiveQA` and similar programs are constructed with no real task instruction;
+    DSPy synthesizes "Given the fields `x`, produce the fields `y`." which is
+    structural scaffolding, not optimizable content. `_extract_instruction` is
+    the single source of truth and must normalize the scaffold away so every
+    downstream consumer (proposer, critic, judge) sees the same canonical "".
+    """
+    program = _SingleSlotProgram(instruction="")
+    assert sbo._extract_instruction(program) == ""
+
+
+def test_extract_instruction_unifies_predictors_with_only_scaffolds(sbo):
+    """Two predictors with different scaffolds (different field names) are NOT divergent.
+
+    Without normalization-at-source, `dspy.ChainOfThought`-style programs (which
+    produce different scaffold text per predictor because the field lists differ)
+    would falsely trigger the "divergent instructions" guardrail even though
+    neither predictor has a real task instruction. After normalization, both
+    reduce to "" and the program is accepted as a unified target for SBO.
+    """
+
+    class _ScaffoldOnlyProgram(dspy.Module):
+        def __init__(self):
+            super().__init__()
+            self.think = dspy.Predict(dspy.Signature("question -> reasoning", ""))
+            self.answer = dspy.Predict(
+                dspy.Signature("question, reasoning -> answer", "")
+            )
+
+        def forward(self, question: str):
+            reasoning = self.think(question=question).reasoning
+            return self.answer(question=question, reasoning=reasoning)
+
+    assert sbo._extract_instruction(_ScaffoldOnlyProgram()) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -542,16 +606,19 @@ def test_critique_signature_shapes():
 
 
 def test_format_failures_renders_expected_block(sbo):
+    """`_format_failures` is a pure concat template; production strings now
+    drop redundant single-field prefixes (the outer Input/Expected/Predicted
+    label is sufficient)."""
     rendered = sbo._format_failures([
-        {"input": "question: q1", "expected": "answer: a", "predicted": "answer: b", "score": 0.25},
-        {"input": "question: q2", "expected": "answer: c", "predicted": "answer: d", "score": 0.10},
+        {"input": "q1", "expected": "a", "predicted": "b", "score": 0.25},
+        {"input": "q2", "expected": "c", "predicted": "d", "score": 0.10},
     ])
 
     assert rendered == (
-        "Example 1:\nInput: question: q1\nExpected: answer: a\n"
-        "Predicted: answer: b\nScore: 0.25\n\n"
-        "Example 2:\nInput: question: q2\nExpected: answer: c\n"
-        "Predicted: answer: d\nScore: 0.10"
+        "Example 1:\nInput: q1\nExpected: a\n"
+        "Predicted: b\nScore: 0.25\n\n"
+        "Example 2:\nInput: q2\nExpected: c\n"
+        "Predicted: d\nScore: 0.10"
     )
 
 
@@ -573,8 +640,51 @@ def test_sample_failures_only_collects_below_threshold(sbo, monkeypatch):
     failures = sbo._sample_failures(program, examples, sample_size=2, score_threshold=0.8)
 
     assert len(failures) == 1
-    assert failures[0]["input"] == "question: bad"
+    assert failures[0]["input"] == "bad"
     assert failures[0]["score"] == 0.0
+
+
+def test_sample_failures_expected_only_contains_signature_output_fields(sbo, monkeypatch):
+    """`expected` must be scoped to the program signature's output fields.
+
+    `Example.labels()` returns every non-input field — for HotPotQA-style data
+    that includes large metadata (`context`, `gold_titles`, `id`, `type`) the
+    program neither consumes nor emits. The critic should only see what the
+    program is actually being asked to produce.
+    """
+    hotpot_like = (
+        Example(
+            question="Which film was first, Fig Trees or Pond Hockey?",
+            answer="Pond Hockey",
+            id="5ab6a095554299710c8d1efe",
+            type="comparison",
+            context={"title": ["..."], "sentences": [["..."]]},
+            gold_titles={"Pond Hockey (film)", "Fig Trees"},
+        ).with_inputs("question")
+    )
+
+    program = _SingleSlotProgram()
+    monkeypatch.setattr(
+        program, "forward", lambda question: Prediction(answer="wrong-guess")
+    )
+    sbo.metric = lambda *a, **kw: 0.0
+
+    failures = sbo._sample_failures(program, [hotpot_like], sample_size=1)
+
+    assert len(failures) == 1
+    expected = failures[0]["expected"]
+
+    assert expected == "Pond Hockey"
+    for leaked in ("id:", "type:", "context:", "gold_titles:"):
+        assert leaked not in expected, f"{leaked!r} leaked into the critique prompt"
+
+
+def test_collect_output_field_names_unions_across_predictors(sbo):
+    """Multi-predictor programs contribute every declared output field name."""
+    program = _UnifiedMultiSlotProgram()
+    names = sbo._collect_output_field_names(program)
+
+    assert names == {"reasoning", "answer"}
 
 
 def test_sample_failures_skips_examples_that_raise(sbo, monkeypatch):
@@ -597,7 +707,7 @@ def test_sample_failures_skips_examples_that_raise(sbo, monkeypatch):
     failures = sbo._sample_failures(program, examples, sample_size=2)
     inputs = sorted(f["input"] for f in failures)
 
-    assert inputs == ["question: ok"]
+    assert inputs == ["ok"]
 
 
 def test_generate_critique_returns_no_failure_message_when_all_pass(sbo, monkeypatch):
