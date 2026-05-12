@@ -8,7 +8,10 @@ a "bundle" of historical critiques and using them to construct a cutting-plane m
 """
 
 import logging
+import json
 import random
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -93,6 +96,8 @@ class SemanticBundleOptimization(Teleprompter):
         max_null_steps: int = 5,
         temperature: float = 0.7,
         track_stats: bool = True,
+        eval_num_threads: int = 1,
+        proposer_max_retries: int = 2,
     ):
         super().__init__()
         self.metric = metric
@@ -111,8 +116,121 @@ class SemanticBundleOptimization(Teleprompter):
         self.max_null_steps = max_null_steps
         self.temperature = temperature
         self.track_stats = track_stats
+        self.eval_num_threads = max(1, eval_num_threads)
+        self.proposer_max_retries = max(0, proposer_max_retries)
 
         self.result: Optional[SBOResult] = None
+
+    def _extract_text(self, response: Any) -> str:
+        """Normalize LM responses into plain text across providers/adapters."""
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response
+        if isinstance(response, list):
+            if not response:
+                return ""
+            return self._extract_text(response[0])
+        if isinstance(response, dict):
+            # Common response shapes across SDKs/providers.
+            for key in ("text", "content", "completion", "response", "output"):
+                value = response.get(key)
+                if value is not None:
+                    return self._extract_text(value)
+            # OpenAI-like: {"message": {"content": "..."}}
+            message = response.get("message")
+            if message is not None:
+                return self._extract_text(message)
+            choices = response.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0]
+                if isinstance(first, dict):
+                    if "text" in first:
+                        return self._extract_text(first.get("text"))
+                    if "message" in first:
+                        return self._extract_text(first.get("message"))
+            # Last-resort fallback for unexpected dicts.
+            return str(response)
+        return str(response)
+
+    def _format_critique_payload(
+        self,
+        value: Any,
+        preferred_keys: tuple[str, ...] = (),
+        prefer_scalar: bool = False
+    ) -> str:
+        """Format DSPy objects for critique prompts without wrapper noise."""
+        payload = value
+        if hasattr(payload, "items"):
+            try:
+                payload = dict(payload.items())
+            except Exception:
+                pass
+
+        if isinstance(payload, dict):
+            # Skip known bulky/noisy fields unless explicitly preferred.
+            noisy_keys = {
+                "context", "metadata", "trace", "history", "demos",
+                "input_keys", "_input_keys", "_store", "id",
+                "gold_titles", "type"
+            }
+            filtered: dict[str, Any] = {}
+            for key in preferred_keys:
+                if key in payload:
+                    filtered[key] = payload[key]
+
+            for key, raw_value in payload.items():
+                if key in filtered:
+                    continue
+                if key in noisy_keys and key not in preferred_keys:
+                    continue
+                if isinstance(raw_value, (str, int, float, bool)) or raw_value is None:
+                    filtered[key] = raw_value
+                elif isinstance(raw_value, (list, tuple)):
+                    # Keep small scalar lists only.
+                    if len(raw_value) <= 5 and all(
+                        isinstance(item, (str, int, float, bool)) or item is None
+                        for item in raw_value
+                    ):
+                        filtered[key] = list(raw_value)
+                elif isinstance(raw_value, set):
+                    # Sets are usually tiny label collections (e.g., gold_titles).
+                    if len(raw_value) <= 5 and all(
+                        isinstance(item, (str, int, float, bool)) or item is None
+                        for item in raw_value
+                    ):
+                        filtered[key] = sorted(raw_value, key=str)
+
+            payload = filtered if filtered else {
+                key: payload[key]
+                for key in preferred_keys
+                if key in payload
+            }
+
+        if prefer_scalar and isinstance(payload, dict):
+            for key in preferred_keys:
+                if key in payload:
+                    payload = payload[key]
+                    break
+            else:
+                # Fallback to first scalar value if preferred keys are unavailable.
+                for raw_value in payload.values():
+                    if isinstance(raw_value, (str, int, float, bool)) or raw_value is None:
+                        payload = raw_value
+                        break
+
+        try:
+            if isinstance(payload, (dict, list, tuple, set)):
+                text = json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str)
+            else:
+                text = str(payload)
+        except Exception:
+            text = str(payload)
+
+        max_chars = 350
+        if len(text) > max_chars:
+            text = f"{text[:max_chars]}..."
+        return text
 
     def compile(
         self,
@@ -150,7 +268,7 @@ class SemanticBundleOptimization(Teleprompter):
         logger.info(f"\n{'='*60}")
         logger.info(f"INITIAL PROMPTS EXTRACTED:")
         for pred_name, prompt_text in original_prompts.items():
-            logger.info(f"  [{pred_name}]: {repr(prompt_text)[:200]}")
+            logger.info(f"  [{pred_name}]: {prompt_text}")
         logger.info(f"{'='*60}\n")
 
         original_loss = self._evaluate_program(student, valset)
@@ -158,7 +276,7 @@ class SemanticBundleOptimization(Teleprompter):
 
         initial_critique = self._generate_critique(student, trainset, original_prompts, critic_lm)
         logger.info(f"\nINITIAL CRITIQUE:")
-        logger.info(f"  {initial_critique[:500]}")
+        logger.info(f"  {initial_critique}")
         logger.info(f"")
 
         bundle = [BundleEntry(
@@ -176,6 +294,7 @@ class SemanticBundleOptimization(Teleprompter):
         num_serious = 0
         num_null = 0
         consecutive_null = 0
+        current_critique = initial_critique
 
         for iteration in range(1, self.max_iterations + 1):
             logger.info(f"\n{'='*60}")
@@ -185,11 +304,11 @@ class SemanticBundleOptimization(Teleprompter):
 
             # Stage 1: Generate candidates (Proposer)
             logger.info(f"\nCurrent critique for candidate generation:")
-            logger.info(f"  {bundle[center_idx].critique[:300]}...")
+            logger.info(f"  {current_critique}")
 
             candidates = self._generate_candidates(
                 center_program,
-                bundle[center_idx].critique,
+                current_critique,
                 proposer_lm
             )
 
@@ -199,7 +318,7 @@ class SemanticBundleOptimization(Teleprompter):
                 cand_prompts = self._extract_prompts(candidate)
                 logger.info(f"  Candidate {i+1} prompts:")
                 for pred_name, prompt_text in cand_prompts.items():
-                    logger.info(f"    [{pred_name}]: {repr(prompt_text)[:200]}")
+                    logger.info(f"    [{pred_name}]: {prompt_text}")
                     # Check if this candidate is different from center
                     if prompt_text == bundle[center_idx].prompt.get(pred_name):
                         logger.warning(f"    ⚠ Candidate {i+1} [{pred_name}] is IDENTICAL to center!")
@@ -237,11 +356,25 @@ class SemanticBundleOptimization(Teleprompter):
                 # Check if changed
                 is_same = (prompt_text == bundle[center_idx].prompt.get(pred_name, ""))
                 status = "[UNCHANGED]" if is_same else "[MODIFIED]"
-                logger.info(f"  [{pred_name}] {status}: {repr(prompt_text)[:200]}")
+                logger.info(f"  [{pred_name}] {status}: {prompt_text}")
             logger.info(f"{'='*60}\n")
 
+            candidate_is_unchanged = all(
+                best_candidate_prompts.get(pred_name, "") == bundle[center_idx].prompt.get(pred_name, "")
+                for pred_name in bundle[center_idx].prompt
+            )
+            if candidate_is_unchanged:
+                logger.info("Selected candidate is unchanged vs center; forcing NULL STEP.")
+            if predicted_improvement <= 0:
+                logger.info("Predicted improvement is non-positive; forcing NULL STEP.")
+
             # Descent test: Serious vs Null step
-            if actual_improvement >= self.descent_param * predicted_improvement:
+            if (
+                not candidate_is_unchanged
+                and predicted_improvement > 0
+                and actual_improvement > 0
+                and actual_improvement >= self.descent_param * predicted_improvement
+            ):
                 # SERIOUS STEP - Accept candidate as new center
                 logger.info("✓ SERIOUS STEP: Accepting candidate as new center")
 
@@ -294,6 +427,8 @@ class SemanticBundleOptimization(Teleprompter):
                 critique=critique,
                 iteration=iteration
             ))
+            # Advance critique signal every iteration, even during null steps.
+            current_critique = critique
 
             # Termination check
             if consecutive_null >= self.max_null_steps:
@@ -338,6 +473,24 @@ class SemanticBundleOptimization(Teleprompter):
                 prompts[pred_name] = pred.signature.instructions or ""
         return prompts
 
+    def _normalize_instruction_text(self, instruction: str) -> str:
+        """Keep only semantic instruction text; drop DSPy auto-scaffold defaults."""
+        text = (instruction or "").strip()
+        if not text:
+            return ""
+
+        # DSPy may synthesize structural default instructions such as:
+        # "Given the fields `question`, produce the fields `answer`."
+        # Treat those as empty so SBO optimizes task instructions only.
+        scaffold_pattern = re.compile(
+            r"^given the fields\s+`?.+?`?,\s*produce the fields\s+`?.+?`?\.?$",
+            re.IGNORECASE | re.DOTALL,
+        )
+        if scaffold_pattern.match(text):
+            return ""
+
+        return text
+
     def _build_program_from_prompts(self, template: Module, prompts: dict[str, str]) -> Module:
         """Build a program by setting prompts in a template."""
         program = template.deepcopy()
@@ -354,24 +507,60 @@ class SemanticBundleOptimization(Teleprompter):
     def _evaluate_program(self, program: Module, examples: list[Example]) -> float:
         """Evaluate program on examples using the metric (robust loss estimation)."""
         total_loss = 0.0
+        num_threads = max(1, self.eval_num_threads)
         logger.info(f"Evaluating program on {len(examples)} examples...")
-        for idx, ex in enumerate(examples):
-            try:
-                logger.debug(f"  Example {idx+1}/{len(examples)}: Running program...")
-                pred = program(**ex.inputs())
-                logger.debug(f"  Example {idx+1}/{len(examples)}: Computing metric...")
-                score = self.metric(ex, pred, None)
-                # Convert score to loss (assuming metric returns [0,1] with 1=best)
-                loss = 1.0 - float(score)
+        logger.info(f"Using {'parallel' if num_threads > 1 else 'sequential'} SBO eval (num_threads={num_threads})")
+
+        if num_threads == 1:
+            for idx, ex in enumerate(examples):
+                loss, error = self._evaluate_single_example(program, ex)
+                if error is not None:
+                    logger.warning(f"Evaluation error on example {idx+1}: {error}")
+                    logger.debug(f"  Example inputs: {ex.inputs()}")
                 total_loss += loss
-                logger.debug(f"  Example {idx+1}/{len(examples)}: score={score:.3f}, loss={loss:.3f}")
-            except Exception as e:
-                logger.warning(f"Evaluation error on example {idx+1}: {e}")
-                logger.debug(f"  Example inputs: {ex.inputs()}")
-                total_loss += 1.0  # Max penalty
+        else:
+            indexed_losses: dict[int, tuple[float, str | None, Example]] = {}
+            executor = ThreadPoolExecutor(max_workers=num_threads)
+            try:
+                futures = {
+                    executor.submit(self._evaluate_single_example, program, ex): idx
+                    for idx, ex in enumerate(examples)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    ex = examples[idx]
+                    try:
+                        loss, error = future.result()
+                    except Exception as e:  # Defensive fallback
+                        loss, error = 1.0, str(e)
+                    indexed_losses[idx] = (loss, error, ex)
+            except KeyboardInterrupt:
+                logger.warning("SBO parallel evaluation interrupted; cancelling pending tasks...")
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+
+            for idx in range(len(examples)):
+                loss, error, ex = indexed_losses[idx]
+                if error is not None:
+                    logger.warning(f"Evaluation error on example {idx+1}: {error}")
+                    logger.debug(f"  Example inputs: {ex.inputs()}")
+                total_loss += loss
+
         avg_loss = total_loss / len(examples)
         logger.info(f"Program evaluation complete: avg_loss={avg_loss:.4f}")
         return avg_loss
+
+    def _evaluate_single_example(self, program: Module, ex: Example) -> tuple[float, str | None]:
+        """Evaluate one example and return (loss, optional error string)."""
+        try:
+            pred = program(**ex.inputs())
+            score = self.metric(ex, pred, None)
+            loss = 1.0 - float(score)
+            return loss, None
+        except Exception as e:
+            return 1.0, str(e)
 
     def _generate_critique(
         self,
@@ -389,9 +578,21 @@ class SemanticBundleOptimization(Teleprompter):
                 score = self.metric(ex, pred, None)
                 if score < 0.8:  # Consider as failure
                     failures.append({
-                        "input": str(ex.inputs()),
-                        "expected": str(ex.labels()),
-                        "predicted": str(pred),
+                        "input": self._format_critique_payload(
+                            ex.inputs(),
+                            preferred_keys=("question", "query", "prompt", "instruction"),
+                            prefer_scalar=True
+                        ),
+                        "expected": self._format_critique_payload(
+                            ex.labels(),
+                            preferred_keys=("answer", "answers", "label", "labels", "output", "gold", "gold_answer"),
+                            prefer_scalar=True
+                        ),
+                        "predicted": self._format_critique_payload(
+                            pred,
+                            preferred_keys=("answer", "answers", "label", "output", "completion", "response"),
+                            prefer_scalar=True
+                        ),
                         "score": float(score)
                     })
             except:
@@ -422,11 +623,11 @@ Instructions:
 
 Critique:"""
 
+        logger.info(f"Critique prompt: {critique_prompt}")
         with dspy.context(lm=lm, temperature=self.temperature):
             response = lm(critique_prompt)
 
-        # LM returns a list of completions, get the first one
-        return (response[0] if isinstance(response, list) else response).strip()
+        return self._extract_text(response).strip()
 
     def _generate_failure_critique(
         self,
@@ -437,14 +638,52 @@ Critique:"""
         critic_lm: LM
     ) -> str:
         """Generate critique explaining why a candidate failed to improve."""
-        current_loss = self._evaluate_program(program, examples)
+        # Use a bounded sample for failure critique to reduce null-step overhead.
+        eval_examples = random.sample(examples, min(3, len(examples)))
+        current_loss = self._evaluate_program(program, eval_examples)
 
         prompt_text = "\n\n".join([f"{k}: {v}" for k, v in prompts.items()])
+        failures = []
+        for ex in random.sample(eval_examples, min(3, len(eval_examples))):
+            try:
+                pred = program(**ex.inputs())
+                score = self.metric(ex, pred, None)
+                if score < 0.8:  # Consider as failure
+                    failures.append({
+                        "input": self._format_critique_payload(
+                            ex.inputs(),
+                            preferred_keys=("question", "query", "prompt", "instruction"),
+                            prefer_scalar=True
+                        ),
+                        "expected": self._format_critique_payload(
+                            ex.labels(),
+                            preferred_keys=("answer", "answers", "label", "labels", "output", "gold", "gold_answer"),
+                            prefer_scalar=True
+                        ),
+                        "predicted": self._format_critique_payload(
+                            pred,
+                            preferred_keys=("answer", "answers", "label", "output", "completion", "response"),
+                            prefer_scalar=True
+                        ),
+                        "score": float(score)
+                    })
+            except Exception:
+                continue
+
+        failures_text = "No sampled examples available."
+        if failures:
+            failures_text = "\n\n".join([
+                f"Example {i+1}:\nInput: {f['input']}\nExpected: {f['expected']}\nPredicted: {f['predicted']}\nScore: {f['score']:.2f}"
+                for i, f in enumerate(failures)
+            ])
 
         critique_prompt = f"""You are an expert prompt engineer. A candidate prompt was tested but failed to improve performance.
 
 Candidate Prompt:
 {prompt_text}
+
+Sampled Failure Context:
+{failures_text}
 
 Current Loss: {current_loss:.4f}
 Target Loss: {target_loss:.4f}
@@ -454,11 +693,13 @@ Analyze why this candidate failed to improve performance. Provide a specific, ac
 
 Critique:"""
 
+        logger.info(f"Critique prompt: {critique_prompt}")
         with dspy.context(lm=critic_lm, temperature=self.temperature):
             response = critic_lm(critique_prompt)
 
-        # LM returns a list of completions, get the first one
-        return (response[0] if isinstance(response, list) else response).strip()
+        logger.info(f"Critique response: {response}")
+        logger.info(f"Critique response text: {self._extract_text(response).strip()}")
+        return self._extract_text(response).strip()
 
     def _generate_candidates(
         self,
@@ -468,7 +709,24 @@ Critique:"""
     ) -> list[Module]:
         """Generate N candidate variations addressing the critique (Proposer)."""
         center_prompts = self._extract_prompts(center_program)
-        prompt_text = "\n\n".join([f"{k}: {v}" for k, v in center_prompts.items()])
+        logger.info(f"Center prompts: {center_prompts}")
+        proposer_prompts = {
+            name: self._normalize_instruction_text(text)
+            for name, text in center_prompts.items()
+        }
+        logger.info(f"Proposer prompts: {proposer_prompts}")
+
+        if len(proposer_prompts) == 1:
+            # Single-predictor case: provide pure instruction text without predictor-name prefix.
+            prompt_text = next(iter(proposer_prompts.values()))
+        else:
+            prompt_text = "\n\n".join(
+                [f"[COMPONENT: {k}]\n{v}" for k, v in proposer_prompts.items()]
+            )
+
+        logger.info(f"Proposer prompt text: {prompt_text}")
+        if not prompt_text.strip():
+            prompt_text = "(no task-specific instruction currently set)"
 
         proposer_prompt = f"""You are an intelligent optimizer. Generate {self.num_candidates} variations of the prompt that address the critique while preserving the original intent.
 
@@ -481,64 +739,97 @@ Constraints:
 1. Local edits only: Do not rewrite the entire prompt from scratch. Keep structure similar.
 2. Focus: Address the critique directly
 3. Diversity: Generate {self.num_candidates} distinct variations
+4. Do NOT repeat this instruction block, do NOT include placeholders.
+5. Return machine-readable JSON only.
 
-Output Format: Return exactly {self.num_candidates} candidate prompts. Each candidate should start with "CANDIDATE N:" on its own line, followed by the improved prompt text.
+Output Format (STRICT):
+{{"candidates": ["<candidate 1 text>", "<candidate 2 text>", ...]}}
+Return exactly {self.num_candidates} strings inside "candidates".
+Do not include markdown/code fences, labels, or any extra keys.
 
-Example format:
-CANDIDATE 1:
-Your first improved prompt text here
-CANDIDATE 2:
-Your second improved prompt text here
-CANDIDATE 3:
-Your third improved prompt text here
+JSON:"""
 
-Candidates:"""
+        response_text = ""
+        cleaned_candidates: list[str] = []
+        for attempt in range(self.proposer_max_retries + 1):
+            attempt_prompt = proposer_prompt
+            if attempt > 0:
+                attempt_prompt += (
+                    "\n\nYour previous output could not be parsed into valid candidates. "
+                    "Return ONLY valid JSON in the exact schema."
+                )
+            logger.info(f"Proposer prompt: {attempt_prompt}")
+            with dspy.context(lm=lm, temperature=self.temperature):
+                response = lm(attempt_prompt)
+            logger.info(f"Proposer response: {response}")
+            response_text = self._extract_text(response)
+            logger.info(f"Proposer response text: {response_text}")
+            logger.info(f"\n{'='*60}")
+            logger.info("PROPOSER RAW RESPONSE (attempt %d):", attempt + 1)
+            logger.info(f"{response_text}")
+            logger.info(f"{'='*60}\n")
 
-        with dspy.context(lm=lm, temperature=self.temperature):
-            response = lm(proposer_prompt)
+            parsed_candidates = self._extract_candidate_texts(response_text)
+            logger.info("Parser extracted %d raw candidate blocks.", len(parsed_candidates))
+            cleaned_candidates = [
+                self._clean_candidate_text(candidate_text)
+                for candidate_text in parsed_candidates
+            ]
+            filtered_candidates: list[str] = []
+            for idx, candidate_text in enumerate(cleaned_candidates, 1):
+                if not candidate_text:
+                    logger.info("Discarded candidate %d after cleaning: empty text.", idx)
+                    continue
+                if self._is_placeholder_candidate(candidate_text):
+                    logger.info("Discarded candidate %d after cleaning: placeholder/artifact.", idx)
+                    continue
+                filtered_candidates.append(candidate_text)
+            cleaned_candidates = filtered_candidates
 
-        # LM returns a list of completions, get the first one
-        response_text = response[0] if isinstance(response, list) else response
+            if len(cleaned_candidates) >= 1:
+                if attempt > 0:
+                    logger.info("Recovered valid candidates after %d retry attempt(s).", attempt)
+                break
 
-        logger.info(f"\n{'='*60}")
-        logger.info(f"PROPOSER RAW RESPONSE (first 500 chars):")
-        logger.info(f"{response_text[:500]}")
-        logger.info(f"{'='*60}\n")
+        for idx, candidate_text in enumerate(cleaned_candidates, 1):
+            logger.info(f"Parsed candidate {idx}:\n{candidate_text}")
 
-        # Parse candidates - improved parsing to handle various LM response formats
+        # Build candidate programs from parsed texts.
         candidates = []
-        
-        # Try splitting by "CANDIDATE" keyword first
-        parts = response_text.split('CANDIDATE')
-        
-        for i, part in enumerate(parts):
-            if i == 0 and not part.strip():
-                continue  # Skip empty first part
-            
-            # Remove the candidate number/marker (e.g., "1:", "2:", etc.)
-            lines = part.strip().split('\n')
-            if lines:
-                # Remove first line if it's just a number/colon
-                first_line = lines[0].strip()
-                if first_line and (first_line[0].isdigit() or first_line.startswith(':')):
-                    # Check if there's actual text after the number
-                    colon_idx = first_line.find(':')
-                    if colon_idx >= 0 and len(first_line) > colon_idx + 1:
-                        # Text on same line as "CANDIDATE N:"
-                        lines[0] = first_line[colon_idx + 1:].strip()
-                    else:
-                        # Number/colon only, skip this line
-                        lines = lines[1:]
-            
-            candidate_text = '\n'.join(lines).strip()
-            
-            # Only add if we have non-empty text
-            if candidate_text:
-                logger.info(f"Parsed candidate {len(candidates)+1}: {repr(candidate_text[:100])}")
+        for candidate_text in cleaned_candidates[:self.num_candidates]:
+            new_prompts = {k: candidate_text for k in center_prompts.keys()}
+            candidates.append(self._build_program_from_prompts(center_program, new_prompts))
+
+        # Fallback: if parsing fails, keep the previous split-based parser as a last resort.
+        if len(candidates) == 0:
+            logger.warning("Parser found no candidates; trying legacy fallback parsing.")
+            parts = response_text.split('CANDIDATE')
+            for i, part in enumerate(parts):
+                if i == 0 and not part.strip():
+                    continue
+                lines = part.strip().split('\n')
+                if lines:
+                    first_line = lines[0].strip()
+                    if first_line and (first_line[0].isdigit() or first_line.startswith(':')):
+                        colon_idx = first_line.find(':')
+                        if colon_idx >= 0 and len(first_line) > colon_idx + 1:
+                            lines[0] = first_line[colon_idx + 1:].strip()
+                        else:
+                            lines = lines[1:]
+                candidate_text = self._clean_candidate_text('\n'.join(lines).strip())
+                if not candidate_text or self._is_placeholder_candidate(candidate_text):
+                    logger.info(
+                        "Legacy parser discarded fragment %d (empty/placeholder).",
+                        i,
+                    )
+                    continue
+                logger.info(f"Legacy parsed candidate {len(candidates)+1}:\n{candidate_text}")
                 new_prompts = {k: candidate_text for k in center_prompts.keys()}
                 candidates.append(self._build_program_from_prompts(center_program, new_prompts))
+                if len(candidates) >= self.num_candidates:
+                    break
 
-        # If parsing failed completely, try to extract at least some variations
+        # If parsing failed completely, fall back to center program.
         if len(candidates) == 0:
             logger.warning("Failed to parse any candidates from LM response, using center program")
             candidates.append(center_program.deepcopy())
@@ -548,7 +839,114 @@ Candidates:"""
             logger.warning(f"Only parsed {len(candidates)} candidates, padding with center program")
             candidates.append(center_program.deepcopy())
 
+        logger.info(
+            "Candidate generation summary: returning %d candidates (%d parsed, %d padded/fallback).",
+            len(candidates[:self.num_candidates]),
+            min(len(cleaned_candidates), self.num_candidates),
+            max(0, self.num_candidates - min(len(cleaned_candidates), self.num_candidates)),
+        )
         return candidates[:self.num_candidates]
+
+    def _extract_candidate_texts(self, response_text: str) -> list[str]:
+        """Extract candidate strings from JSON output first, then header-based fallback."""
+        json_candidates = self._parse_json_candidates(response_text)
+        if json_candidates:
+            return json_candidates
+        return self._parse_candidates_from_response(response_text)
+
+    def _parse_json_candidates(self, response_text: str) -> list[str]:
+        text = self._strip_code_fences(response_text).strip()
+        if not text:
+            return []
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return []
+
+        if isinstance(payload, dict):
+            candidates = payload.get("candidates", [])
+        elif isinstance(payload, list):
+            candidates = payload
+        else:
+            return []
+
+        if not isinstance(candidates, list):
+            return []
+        return [str(candidate).strip() for candidate in candidates if str(candidate).strip()]
+
+    def _strip_code_fences(self, text: str) -> str:
+        stripped = text.strip()
+        if stripped.startswith("```") and stripped.endswith("```"):
+            stripped = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", stripped)
+            stripped = re.sub(r"\n?```$", "", stripped)
+        return stripped
+
+    def _parse_candidates_from_response(self, response_text: str) -> list[str]:
+        """Extract candidate blocks from strict CANDIDATE headers."""
+        header_pattern = re.compile(r"(?im)^\s*candidate\s*(\d+)\s*:\s*(.*)$")
+        matches = list(header_pattern.finditer(response_text))
+        if not matches:
+            return []
+
+        extracted: list[str] = []
+        for idx, match in enumerate(matches):
+            inline_text = match.group(2).strip()
+            start = match.end()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(response_text)
+            block_text = response_text[start:end].strip()
+            if inline_text and block_text:
+                extracted.append(f"{inline_text}\n{block_text}".strip())
+            elif inline_text:
+                extracted.append(inline_text)
+            elif block_text:
+                extracted.append(block_text)
+        return extracted
+
+    def _clean_candidate_text(self, candidate_text: str) -> str:
+        """Strip echoed prompt boilerplate and keep candidate instruction body."""
+        lines = [line.rstrip() for line in candidate_text.splitlines()]
+        cleaned_lines: list[str] = []
+        stop_markers = (
+            "critique:",
+            "constraints:",
+            "output format:",
+            "example format:",
+            "candidates:",
+            "current prompt:",
+        )
+        skip_exact = {
+            "your first improved prompt text here",
+            "your second improved prompt text here",
+            "your third improved prompt text here",
+        }
+
+        for line in lines:
+            lower = line.strip().lower()
+            if re.match(r"^candidate\s*\d+\s*:", lower):
+                break
+            if any(lower.startswith(marker) for marker in stop_markers):
+                break
+            if lower in skip_exact:
+                continue
+            cleaned_lines.append(line)
+
+        return "\n".join(cleaned_lines).strip()
+
+    def _is_placeholder_candidate(self, candidate_text: str) -> bool:
+        """Detect parser artifacts / placeholder texts that should not become prompts."""
+        lowered = " ".join(candidate_text.lower().split())
+        placeholders = (
+            "your first improved prompt text here",
+            "your second improved prompt text here",
+            "your third improved prompt text here",
+            "on its own line, followed by the improved prompt text",
+            "example format",
+        )
+        if any(phrase in lowered for phrase in placeholders):
+            return True
+        if len(lowered) < 12:
+            return True
+        return False
 
     def _compute_semantic_score(
         self,
@@ -605,8 +1003,7 @@ Score:"""
         with dspy.context(lm=lm, temperature=0.0):  # Deterministic
             response = lm(judge_prompt)
 
-        # LM returns a list of completions, get the first one
-        response_text = (response[0] if isinstance(response, list) else response).strip()
+        response_text = self._extract_text(response).strip()
 
         # Parse score
         try:
