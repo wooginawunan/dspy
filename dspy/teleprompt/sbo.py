@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class BundleEntry:
     """A single entry in the optimization bundle."""
-    prompt: dict[str, str]  # Component name -> instruction text
+    instruction: str  # The single instruction text being optimized.
     loss: float  # F̃(p_i) - smoothed/robust loss
     critique: str  # Textual critique c_i
     iteration: int  # When this was added
@@ -124,6 +124,11 @@ class SemanticBundleOptimization(Teleprompter):
 
     Unlike greedy methods (GEPA, OPRO) that only consider the latest critique, SBO maintains
     a bundle of historical constraints to prevent limit cycles and catastrophic forgetting.
+
+    Scope: SBO optimizes a **single instruction string** which is then broadcast to every
+    predictor in the program. Programs whose predictors carry divergent task instructions
+    are rejected with a ValueError — use a per-predictor optimizer (COPRO / MIPRO / GEPA)
+    for that case.
 
     Key Components:
     - **Judge**: Semantic inner product Ŝ_J(p, p_ref, c) - scores alignment with critique
@@ -243,27 +248,22 @@ class SemanticBundleOptimization(Teleprompter):
         logger.info(f"Starting SBO optimization with {len(trainset)} train, {len(valset)} val examples")
 
         # Initialize bundle with original program
-        original_prompts = self._extract_prompts(student)
+        original_instruction = self._extract_instruction(student)
         logger.info(f"\n{'='*60}")
-        logger.info(f"INITIAL PROMPTS EXTRACTED:")
-        # We only optimize the instruction part of the prompt, not the context.
-        # TODO: confirm this after we have other programs used. 
-        for pred_name, instruction in original_prompts.items():
-            logger.info(f"  [{pred_name}]: {instruction}")
+        logger.info(f"INITIAL INSTRUCTION EXTRACTED:")
+        logger.info(f"  {original_instruction!r}")
         logger.info(f"{'='*60}\n")
 
         original_loss = self._evaluate_program(student, valset)
         logger.info(f"Original loss on valset: {original_loss:.4f}")
 
-        # Generate initial critique 
-        # TODO: add the addition step to generate reasoning per example first
-        initial_critique = self._generate_critique(student, trainset, original_prompts, critic_lm)
+        initial_critique = self._generate_critique(student, trainset, original_instruction, critic_lm)
         logger.info(f"\nINITIAL CRITIQUE:")
         logger.info(f"  {initial_critique}")
         logger.info(f"")
 
         bundle = [BundleEntry(
-            prompt=original_prompts,
+            instruction=original_instruction,
             loss=original_loss,
             critique=initial_critique,
             iteration=0
@@ -296,18 +296,15 @@ class SemanticBundleOptimization(Teleprompter):
             )
 
             logger.info(f"\nGenerated {len(candidates)} candidate programs")
-            # Log all candidates to see what was generated
+            center_instruction = bundle[center_idx].instruction
             for i, candidate in enumerate(candidates):
-                cand_prompts = self._extract_prompts(candidate)
-                logger.info(f"  Candidate {i+1} prompts:")
-                for pred_name, prompt_text in cand_prompts.items():
-                    logger.info(f"    [{pred_name}]: {prompt_text}")
-                    # Check if this candidate is different from center
-                    if prompt_text == bundle[center_idx].prompt.get(pred_name):
-                        logger.warning(f"    ⚠ Candidate {i+1} [{pred_name}] is IDENTICAL to center!")
+                candidate_instruction = self._extract_instruction(candidate)
+                logger.info(f"  Candidate {i+1}: {candidate_instruction!r}")
+                if candidate_instruction == center_instruction:
+                    logger.warning(f"    ⚠ Candidate {i+1} is IDENTICAL to center!")
 
             # Stage 2: Filter candidates (Verifier)
-            best_candidate, best_candidate_prompts = self._select_best_candidate(
+            best_candidate, best_candidate_instruction = self._select_best_candidate(
                 candidates,
                 bundle,
                 lambda_current,
@@ -319,13 +316,16 @@ class SemanticBundleOptimization(Teleprompter):
 
             # Compute predicted improvement
             model_value = self._compute_model_value(
-                best_candidate_prompts,
+                best_candidate_instruction,
                 bundle,
                 lambda_current,
                 judge_lm
             )
             predicted_improvement = bundle[center_idx].loss - model_value
             actual_improvement = bundle[center_idx].loss - candidate_loss
+
+            candidate_is_unchanged = best_candidate_instruction == bundle[center_idx].instruction
+            status = "[UNCHANGED]" if candidate_is_unchanged else "[MODIFIED]"
 
             logger.info(f"\n{'='*60}")
             logger.info(f"ITERATION {iteration} RESULTS:")
@@ -334,18 +334,9 @@ class SemanticBundleOptimization(Teleprompter):
             logger.info(f"  Model value:           {model_value:.4f}")
             logger.info(f"  Predicted improvement: {predicted_improvement:.4f}")
             logger.info(f"  Actual improvement:    {actual_improvement:.4f}")
-            logger.info(f"\nBest candidate selected:")
-            for pred_name, prompt_text in best_candidate_prompts.items():
-                # Check if changed
-                is_same = (prompt_text == bundle[center_idx].prompt.get(pred_name, ""))
-                status = "[UNCHANGED]" if is_same else "[MODIFIED]"
-                logger.info(f"  [{pred_name}] {status}: {prompt_text}")
+            logger.info(f"\nBest candidate selected {status}: {best_candidate_instruction!r}")
             logger.info(f"{'='*60}\n")
 
-            candidate_is_unchanged = all(
-                best_candidate_prompts.get(pred_name, "") == bundle[center_idx].prompt.get(pred_name, "")
-                for pred_name in bundle[center_idx].prompt
-            )
             if candidate_is_unchanged:
                 logger.info("Selected candidate is unchanged vs center; forcing NULL STEP.")
             if predicted_improvement <= 0:
@@ -368,8 +359,8 @@ class SemanticBundleOptimization(Teleprompter):
 
                 # Update sensitivity λ
                 semantic_score = self._compute_semantic_score(
-                    best_candidate_prompts,
-                    bundle[center_idx - 1].prompt,  # Previous center
+                    best_candidate_instruction,
+                    bundle[center_idx - 1].instruction,  # Previous center
                     bundle[center_idx - 1].critique,
                     judge_lm
                 )
@@ -386,7 +377,7 @@ class SemanticBundleOptimization(Teleprompter):
                     logger.info(f"Updated λ: {lambda_current:.3f} (observed: {lambda_obs:.3f})")
 
                 # Generate critique for new center
-                critique = self._generate_critique(best_candidate, trainset, best_candidate_prompts, critic_lm)
+                critique = self._generate_critique(best_candidate, trainset, best_candidate_instruction, critic_lm)
 
             else:
                 # NULL STEP - Reject candidate, refine model
@@ -398,14 +389,14 @@ class SemanticBundleOptimization(Teleprompter):
                 critique = self._generate_failure_critique(
                     best_candidate,
                     trainset,
-                    best_candidate_prompts,
+                    best_candidate_instruction,
                     target_loss=bundle[center_idx].loss,
                     critic_lm=critic_lm
                 )
 
             # Add to bundle (both serious and null steps)
             bundle.append(BundleEntry(
-                prompt=best_candidate_prompts,
+                instruction=best_candidate_instruction,
                 loss=candidate_loss,
                 critique=critique,
                 iteration=iteration
@@ -426,7 +417,7 @@ class SemanticBundleOptimization(Teleprompter):
 
         # Return best program from bundle
         best_idx = min(range(len(bundle)), key=lambda i: bundle[i].loss)
-        best_program = self._build_program_from_prompts(student, bundle[best_idx].prompt)
+        best_program = self._build_program(student, bundle[best_idx].instruction)
 
         val_scores = [b.loss for b in bundle]
 
@@ -448,13 +439,32 @@ class SemanticBundleOptimization(Teleprompter):
 
         return best_program
 
-    def _extract_prompts(self, program: Module) -> dict[str, str]:
-        """Extract instruction prompts from all predictors in the program."""
-        prompts = {}
-        for pred_name, pred in program.named_predictors():
-            if hasattr(pred, 'signature') and hasattr(pred.signature, 'instructions'):
-                prompts[pred_name] = pred.signature.instructions or ""
-        return prompts
+    def _extract_instruction(self, program: Module) -> str:
+        """Return the single instruction SBO will optimize for this program.
+
+        SBO optimizes one instruction string and broadcasts it to every predictor.
+        If the program has multiple predictors with divergent task instructions,
+        raise — there is no single instruction to optimize. Use a per-predictor
+        optimizer (COPRO / MIPRO / GEPA) for that case.
+        """
+        instructions: list[str] = []
+        for _, pred in program.named_predictors():
+            if hasattr(pred, "signature") and hasattr(pred.signature, "instructions"):
+                instructions.append(pred.signature.instructions or "")
+
+        if not instructions:
+            return ""
+
+        distinct_semantic = {
+            self._normalize_instruction_text(text) for text in instructions
+        }
+        if len(distinct_semantic) > 1:
+            raise ValueError(
+                "SBO optimizes a single instruction shared across all predictors, "
+                "but this program has predictors with divergent task instructions. "
+                "Unify them, or use a multi-predictor optimizer (COPRO / MIPRO / GEPA)."
+            )
+        return instructions[0]
 
     def _normalize_instruction_text(self, instruction: str) -> str:
         """Keep only semantic instruction text; drop DSPy auto-scaffold defaults."""
@@ -474,17 +484,13 @@ class SemanticBundleOptimization(Teleprompter):
 
         return text
 
-    def _build_program_from_prompts(self, template: Module, prompts: dict[str, str]) -> Module:
-        """Build a program by setting prompts in a template."""
+    def _build_program(self, template: Module, instruction: str) -> Module:
+        """Return a deepcopy of `template` with `instruction` applied to every predictor."""
         program = template.deepcopy()
-        for pred_name, instruction in prompts.items():
-            for name, pred in program.named_predictors():
-                if name == pred_name:
-                    if hasattr(pred, 'signature'):
-                        # IMPORTANT: with_instructions() returns a NEW signature, must reassign!
-                        new_signature = pred.signature.with_instructions(instruction)
-                        pred.signature = new_signature
-                        logger.debug(f"Applied instruction to {pred_name}: {repr(instruction)[:100]}")
+        for _, pred in program.named_predictors():
+            if hasattr(pred, "signature"):
+                # `with_instructions()` returns a NEW signature, must reassign.
+                pred.signature = pred.signature.with_instructions(instruction)
         return program
 
     def _evaluate_program(self, program: Module, examples: list[Example]) -> float:
@@ -581,22 +587,21 @@ class SemanticBundleOptimization(Teleprompter):
         self,
         program: Module,
         examples: list[Example],
-        prompts: dict[str, str],
+        instruction: str,
         lm: LM
     ) -> str:
-        """Generate critique identifying weaknesses in the program."""
+        """Generate critique identifying weaknesses in the program's instruction."""
         failures = self._sample_failures(program, examples)
 
         if not failures:
             return "The prompt is performing well on the given examples."
 
-        prompt_text = "\n\n".join(f"{k}: {v}" for k, v in prompts.items())
         failures_text = self._format_failures(failures)
 
         with dspy.context(lm=lm, temperature=self.temperature):
             try:
                 result = self._critique(
-                    current_prompt=prompt_text,
+                    current_prompt=instruction,
                     failure_examples=failures_text,
                 )
             except Exception as e:
@@ -610,23 +615,22 @@ class SemanticBundleOptimization(Teleprompter):
         self,
         program: Module,
         examples: list[Example],
-        prompts: dict[str, str],
+        instruction: str,
         target_loss: float,
         critic_lm: LM
     ) -> str:
-        """Generate critique explaining why a candidate failed to improve."""
+        """Generate critique explaining why a candidate's instruction failed to improve."""
         # Use a bounded sample for failure critique to reduce null-step overhead.
         eval_examples = random.sample(examples, min(3, len(examples)))
         current_loss = self._evaluate_program(program, eval_examples)
 
-        prompt_text = "\n\n".join(f"{k}: {v}" for k, v in prompts.items())
         failures = self._sample_failures(program, eval_examples)
         failures_text = self._format_failures(failures) if failures else "No sampled examples available."
 
         with dspy.context(lm=critic_lm, temperature=self.temperature):
             try:
                 result = self._failure_critique(
-                    candidate_prompt=prompt_text,
+                    candidate_prompt=instruction,
                     failure_context=failures_text,
                     current_loss=current_loss,
                     target_loss=target_loss,
@@ -645,25 +649,11 @@ class SemanticBundleOptimization(Teleprompter):
         lm: LM
     ) -> list[Module]:
         """Generate N candidate variations addressing the critique (Proposer)."""
-        center_prompts = self._extract_prompts(center_program)
-        logger.info(f"Center prompts: {center_prompts}")
-        proposer_prompts = {
-            name: self._normalize_instruction_text(text)
-            for name, text in center_prompts.items()
-        }
-        logger.info(f"Proposer prompts: {proposer_prompts}")
+        center_instruction = self._extract_instruction(center_program)
+        normalized_instruction = self._normalize_instruction_text(center_instruction)
+        logger.info(f"Center instruction: {center_instruction!r}")
 
-        if len(proposer_prompts) == 1:
-            prompt_text = next(iter(proposer_prompts.values()))
-        else:
-            prompt_text = "\n\n".join(
-                f"[COMPONENT: {k}]\n{v}" for k, v in proposer_prompts.items()
-            )
-
-        if not prompt_text.strip():
-            prompt_text = "(no task-specific instruction currently set)"
-
-        logger.info(f"Proposer prompt text: {prompt_text}")
+        prompt_text = normalized_instruction or "(no task-specific instruction currently set)"
 
         try:
             with dspy.context(lm=lm, temperature=self.temperature):
@@ -685,10 +675,10 @@ class SemanticBundleOptimization(Teleprompter):
         for idx, candidate_text in enumerate(cleaned_candidates, 1):
             logger.info(f"Parsed candidate {idx}:\n{candidate_text}")
 
-        candidates: list[Module] = []
-        for candidate_text in cleaned_candidates[:self.num_candidates]:
-            new_prompts = {k: candidate_text for k in center_prompts.keys()}
-            candidates.append(self._build_program_from_prompts(center_program, new_prompts))
+        candidates: list[Module] = [
+            self._build_program(center_program, candidate_text)
+            for candidate_text in cleaned_candidates[:self.num_candidates]
+        ]
 
         if not candidates:
             logger.warning("Proposer returned no usable candidates; using center program.")
@@ -712,8 +702,8 @@ class SemanticBundleOptimization(Teleprompter):
 
     def _compute_semantic_score(
         self,
-        candidate_prompts: dict[str, str],
-        reference_prompts: dict[str, str],
+        candidate_instruction: str,
+        reference_instruction: str,
         critique: str,
         lm: LM
     ) -> float:
@@ -725,28 +715,25 @@ class SemanticBundleOptimization(Teleprompter):
         scores = []
 
         for _ in range(self.num_judge_samples):
-            score = self._judge_single(candidate_prompts, reference_prompts, critique, lm)
+            score = self._judge_single(candidate_instruction, reference_instruction, critique, lm)
             scores.append(score)
 
         return sum(scores) / len(scores)
 
     def _judge_single(
         self,
-        candidate_prompts: dict[str, str],
-        reference_prompts: dict[str, str],
+        candidate_instruction: str,
+        reference_instruction: str,
         critique: str,
         lm: LM
     ) -> float:
         """Single judge evaluation (returns clamped to [-1, 1])."""
-        candidate_text = "\n\n".join(f"{k}: {v}" for k, v in candidate_prompts.items())
-        reference_text = "\n\n".join(f"{k}: {v}" for k, v in reference_prompts.items())
-
         with dspy.context(lm=lm, temperature=0.0):  # Deterministic
             try:
                 result = self._judge(
-                    reference_prompt=reference_text,
+                    reference_prompt=reference_instruction,
                     critique=critique,
-                    candidate_prompt=candidate_text,
+                    candidate_prompt=candidate_instruction,
                 )
             except Exception as e:
                 # Adapter exhausted retries on a malformed response. Treat as orthogonal.
@@ -767,11 +754,11 @@ class SemanticBundleOptimization(Teleprompter):
         bundle: list[BundleEntry],
         lambda_current: float,
         lm: LM
-    ) -> tuple[Module, dict[str, str]]:
+    ) -> tuple[Module, str]:
         """
         Select best candidate by minimizing cumulative semantic violation (Verifier).
 
-        Returns: (best_program, best_prompts)
+        Returns: (best_program, best_instruction)
         """
         logger.info(f"\n{'='*60}")
         logger.info(f"VERIFIER: Evaluating {len(candidates)} candidates against bundle of {len(bundle)}")
@@ -780,18 +767,18 @@ class SemanticBundleOptimization(Teleprompter):
 
         best_violation = float('inf')
         best_candidate = candidates[0]
-        best_prompts = self._extract_prompts(candidates[0])
+        best_instruction = self._extract_instruction(candidates[0])
 
         for idx, candidate in enumerate(candidates):
-            candidate_prompts = self._extract_prompts(candidate)
+            candidate_instruction = self._extract_instruction(candidate)
 
             # Compute cumulative violation against all bundle entries
             total_violation = 0.0
             scores_detail = []
             for entry in bundle:
                 score = self._compute_semantic_score(
-                    candidate_prompts,
-                    entry.prompt,
+                    candidate_instruction,
+                    entry.instruction,
                     entry.critique,
                     lm
                 )
@@ -807,15 +794,15 @@ class SemanticBundleOptimization(Teleprompter):
             if total_violation < best_violation:
                 best_violation = total_violation
                 best_candidate = candidate
-                best_prompts = candidate_prompts
+                best_instruction = candidate_instruction
 
         logger.info(f"\n✓ Selected candidate with violation: {best_violation:.4f}")
         logger.info(f"{'='*60}\n")
-        return best_candidate, best_prompts
+        return best_candidate, best_instruction
 
     def _compute_model_value(
         self,
-        prompts: dict[str, str],
+        instruction: str,
         bundle: list[BundleEntry],
         lambda_current: float,
         lm: LM
@@ -826,7 +813,7 @@ class SemanticBundleOptimization(Teleprompter):
         model_value = float('-inf')
 
         for entry in bundle:
-            score = self._compute_semantic_score(prompts, entry.prompt, entry.critique, lm)
+            score = self._compute_semantic_score(instruction, entry.instruction, entry.critique, lm)
             value = entry.loss - lambda_current * score
             model_value = max(model_value, value)
 

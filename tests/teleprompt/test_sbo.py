@@ -40,6 +40,38 @@ class _SingleSlotProgram(dspy.Module):
         return self.answer(question=question)
 
 
+class _DivergentMultiSlotProgram(dspy.Module):
+    """Two-predictor program whose predictors carry different task instructions."""
+
+    def __init__(self):
+        super().__init__()
+        self.think = dspy.Predict(
+            dspy.Signature("question -> reasoning", "Think step by step.")
+        )
+        self.answer = dspy.Predict(
+            dspy.Signature("question, reasoning -> answer", "Output only the final answer.")
+        )
+
+    def forward(self, question: str):
+        reasoning = self.think(question=question).reasoning
+        return self.answer(question=question, reasoning=reasoning)
+
+
+class _UnifiedMultiSlotProgram(dspy.Module):
+    """Two-predictor program whose predictors share the same task instruction."""
+
+    SHARED = "Answer carefully and concisely."
+
+    def __init__(self):
+        super().__init__()
+        self.think = dspy.Predict(dspy.Signature("question -> reasoning", self.SHARED))
+        self.answer = dspy.Predict(dspy.Signature("question, reasoning -> answer", self.SHARED))
+
+    def forward(self, question: str):
+        reasoning = self.think(question=question).reasoning
+        return self.answer(question=question, reasoning=reasoning)
+
+
 @pytest.fixture
 def sbo() -> SemanticBundleOptimization:
     """A minimally configured SBO instance — only `metric` is required."""
@@ -253,19 +285,57 @@ def test_critique_failure_block_shape(sbo):
 
 
 # ---------------------------------------------------------------------------
+# Instruction extraction: SBO optimizes a single shared instruction.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_instruction_returns_single_predictor_instruction(sbo):
+    program = _SingleSlotProgram(instruction="Answer the question.")
+    assert sbo._extract_instruction(program) == "Answer the question."
+
+
+def test_extract_instruction_accepts_unified_multi_predictor_program(sbo):
+    """Multiple predictors with the SAME instruction are fine — SBO can optimize them."""
+    program = _UnifiedMultiSlotProgram()
+    assert sbo._extract_instruction(program) == _UnifiedMultiSlotProgram.SHARED
+
+
+def test_extract_instruction_rejects_divergent_multi_predictor_program(sbo):
+    """Multiple predictors with DIFFERENT instructions are out of SBO's scope."""
+    program = _DivergentMultiSlotProgram()
+    with pytest.raises(ValueError, match="single instruction"):
+        sbo._extract_instruction(program)
+
+
+def test_build_program_broadcasts_instruction_to_all_predictors(sbo):
+    program = _UnifiedMultiSlotProgram()
+    rebuilt = sbo._build_program(program, "New unified instruction.")
+
+    for _, pred in rebuilt.named_predictors():
+        assert pred.signature.instructions == "New unified instruction."
+
+
+def test_build_program_does_not_mutate_template(sbo):
+    """`_build_program` must return a fresh copy; the original template is unchanged."""
+    program = _SingleSlotProgram(instruction="Original.")
+    _ = sbo._build_program(program, "Rebuilt.")
+    assert sbo._extract_instruction(program) == "Original."
+
+
+# ---------------------------------------------------------------------------
 # Judge module (dspy.Predict-backed).
 # ---------------------------------------------------------------------------
 
 
-CANDIDATE_PROMPTS = {"answer": "Be concise and precise."}
-REFERENCE_PROMPTS = {"answer": "Answer the question."}
+CANDIDATE_INSTRUCTION = "Be concise and precise."
+REFERENCE_INSTRUCTION = "Answer the question."
 CRITIQUE = "Responses are too verbose."
 
 
 def _judge_inputs():
     return {
-        "candidate_prompts": CANDIDATE_PROMPTS,
-        "reference_prompts": REFERENCE_PROMPTS,
+        "candidate_instruction": CANDIDATE_INSTRUCTION,
+        "reference_instruction": REFERENCE_INSTRUCTION,
         "critique": CRITIQUE,
     }
 
@@ -339,7 +409,7 @@ def test_compute_semantic_score_averages_multiple_samples(sbo, monkeypatch):
     monkeypatch.setattr(sbo, "_judge_single", lambda *a, **kw: next(returned))
 
     avg = sbo._compute_semantic_score(
-        CANDIDATE_PROMPTS, REFERENCE_PROMPTS, CRITIQUE, lm=DummyLM([])
+        CANDIDATE_INSTRUCTION, REFERENCE_INSTRUCTION, CRITIQUE, lm=DummyLM([])
     )
 
     assert avg == pytest.approx(0.5)
@@ -372,9 +442,7 @@ def test_proposer_builds_one_program_per_candidate(sbo, monkeypatch):
     candidates = sbo._generate_candidates(center, critique="too vague", lm=DummyLM([]))
 
     assert len(candidates) == 3
-    instructions = [
-        sbo._extract_prompts(c)["answer"] for c in candidates
-    ]
+    instructions = [sbo._extract_instruction(c) for c in candidates]
     assert instructions == ["Be concise.", "Be specific.", "Be friendly."]
 
 
@@ -389,7 +457,7 @@ def test_proposer_pads_with_center_when_under_quota(sbo, monkeypatch):
     candidates = sbo._generate_candidates(center, critique="x", lm=DummyLM([]))
 
     assert len(candidates) == 3
-    instructions = [sbo._extract_prompts(c)["answer"] for c in candidates]
+    instructions = [sbo._extract_instruction(c) for c in candidates]
     assert instructions[0] == "Only one."
     # The remaining slots are filled with copies of the center.
     assert instructions[1] == "Answer the question."
@@ -410,7 +478,7 @@ def test_proposer_falls_back_to_center_on_module_exception(sbo, monkeypatch):
 
     assert len(candidates) == 2
     for c in candidates:
-        assert sbo._extract_prompts(c)["answer"] == "Answer the question."
+        assert sbo._extract_instruction(c) == "Answer the question."
 
 
 def test_proposer_ignores_empty_and_non_string_entries(sbo, monkeypatch):
@@ -428,7 +496,7 @@ def test_proposer_ignores_empty_and_non_string_entries(sbo, monkeypatch):
     candidates = sbo._generate_candidates(center, critique="x", lm=DummyLM([]))
 
     assert len(candidates) == 4
-    instructions = [sbo._extract_prompts(c)["answer"] for c in candidates]
+    instructions = [sbo._extract_instruction(c) for c in candidates]
     # First two come from the proposer, the rest are padded center copies.
     assert instructions[0] == "Valid edit."
     assert instructions[1] == "Another valid edit."
@@ -448,7 +516,7 @@ def test_proposer_handles_none_candidates_field(sbo, monkeypatch):
 
     assert len(candidates) == 2
     for c in candidates:
-        assert sbo._extract_prompts(c)["answer"] == "Answer the question."
+        assert sbo._extract_instruction(c) == "Answer the question."
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +613,7 @@ def test_generate_critique_returns_no_failure_message_when_all_pass(sbo, monkeyp
     critique = sbo._generate_critique(
         program=_SingleSlotProgram(),
         examples=[Example(question="q", answer="a").with_inputs("question")],
-        prompts={"answer": "Answer the question."},
+        instruction="Answer the question.",
         lm=DummyLM([]),
     )
 
@@ -574,12 +642,12 @@ def test_generate_critique_returns_module_output(sbo, monkeypatch):
     out = sbo._generate_critique(
         program=_SingleSlotProgram(),
         examples=[Example(question="q", answer="a").with_inputs("question")],
-        prompts={"answer": "Answer the question."},
+        instruction="Answer the question.",
         lm=DummyLM([]),
     )
 
     assert out == "Too vague about formatting."
-    assert captured["current_prompt"] == "answer: Answer the question."
+    assert captured["current_prompt"] == "Answer the question."
     assert "Score: 0.10" in captured["failure_examples"]
 
 
@@ -600,7 +668,7 @@ def test_generate_critique_falls_back_when_module_raises(sbo, monkeypatch):
     out = sbo._generate_critique(
         program=_SingleSlotProgram(),
         examples=[Example(question="q", answer="a").with_inputs("question")],
-        prompts={"answer": "p"},
+        instruction="p",
         lm=DummyLM([]),
     )
 
@@ -623,7 +691,7 @@ def test_generate_failure_critique_passes_losses_to_module(sbo, monkeypatch):
     out = sbo._generate_failure_critique(
         program=_SingleSlotProgram(),
         examples=[Example(question="q", answer="a").with_inputs("question")],
-        prompts={"answer": "p"},
+        instruction="p",
         target_loss=0.4,
         critic_lm=DummyLM([]),
     )
@@ -646,7 +714,7 @@ def test_generate_failure_critique_falls_back_when_module_raises(sbo, monkeypatc
     out = sbo._generate_failure_critique(
         program=_SingleSlotProgram(),
         examples=[Example(question="q", answer="a").with_inputs("question")],
-        prompts={"answer": "p"},
+        instruction="p",
         target_loss=0.3,
         critic_lm=DummyLM([]),
     )
