@@ -4,6 +4,7 @@ Main experiment runner for prompt optimization.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import time
 from pathlib import Path
@@ -158,10 +159,15 @@ class ExperimentRunner:
     
     def _setup_model(self) -> None:
         """Setup the language model."""
+        model_kwargs = {
+            "model": self.config.model.name,
+            "api_base": self.config.model.api_base,
+            "cache": self.config.model.cache,
+        }
+        model_kwargs.update(self.config.model.params or {})
+
         lm = dspy.LM(
-            model=self.config.model.name,
-            api_base=self.config.model.api_base,
-            cache=self.config.model.cache
+            **model_kwargs
         )
         dspy.configure(lm=lm)
         
@@ -175,42 +181,91 @@ class ExperimentRunner:
         name: str
     ) -> Any:
         """Evaluate a program on a dataset."""
+        num_threads = max(1, self.config.optimizer.num_threads)
         self.logger.logger.info(f"Setting up evaluator for {len(dataset)} examples...")
-        self.logger.logger.info(f"Using {self.config.optimizer.num_threads} thread(s)")
-
-        evaluator = dspy.Evaluate(
-            devset=dataset,
-            metric=metric,
-            num_threads=self.config.optimizer.num_threads,
-            display_table=False,
-            display_progress=True,
+        mode = "parallel" if num_threads > 1 else "sequential"
+        self.logger.logger.info(
+            f"Using per-sample logging mode ({mode} evaluation, num_threads={num_threads})"
         )
+        self.logger.logger.info("Starting evaluation...")
 
-        self.logger.logger.info(f"Starting evaluation...")
-        results = evaluator(program)
-        self.logger.logger.info(f"Evaluation complete")
-        
-        # Log detailed results
+        result_rows: list[tuple[Any, Any, float]] = []
+        indexed_results: dict[int, tuple[Any, Any, float, str | None]] = {}
+
+        if num_threads == 1:
+            for i, example in enumerate(dataset, 1):
+                prediction, score, error = self._evaluate_single_example(program, metric, example)
+                indexed_results[i] = (example, prediction, score, error)
+        else:
+            executor = ThreadPoolExecutor(max_workers=num_threads)
+            try:
+                futures = {
+                    executor.submit(self._evaluate_single_example, program, metric, example): i
+                    for i, example in enumerate(dataset, 1)
+                }
+                for future in as_completed(futures):
+                    i = futures[future]
+                    try:
+                        prediction, score, error = future.result()
+                    except Exception as e:  # Defensive fallback: mark as failed and continue.
+                        prediction = dspy.Prediction()
+                        score = 0.0
+                        error = str(e)
+                    indexed_results[i] = (dataset[i - 1], prediction, score, error)
+            except KeyboardInterrupt:
+                self.logger.logger.warning("Parallel evaluation interrupted; cancelling pending tasks...")
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+
+        for i in range(1, len(dataset) + 1):
+            example, prediction, score, error = indexed_results[i]
+            if error is not None:
+                self.logger.logger.warning(f"[{i}] Evaluation failed: {error}")
+
+            result_rows.append((example, prediction, score))
+
+            question_text = getattr(example, "question", None) or getattr(example, "problem", "")
+            question_preview = question_text[:80] if question_text else ""
+            pred_answer = getattr(prediction, "answer", str(prediction))
+            self.logger.logger.info(f"\n[{i}] Q: {question_preview}...")
+            self.logger.logger.info(f"    Gold: {example.answer}")
+            self.logger.logger.info(f"    Pred: {pred_answer}")
+            self.logger.logger.info(f"    Score: {score:.3f}")
+
+        self.logger.logger.info("Evaluation complete")
+
+        class _EvaluationResult:
+            def __init__(self, rows: list[tuple[Any, Any, float]]):
+                self.results = rows
+
+        results = _EvaluationResult(result_rows)
+
         scores = [score for _, _, score in results.results]
         total_score = sum(scores)
         avg_score = total_score / len(dataset) if dataset else 0
-        
+
         self.logger.logger.info(f"\n{'=' * 50}")
         self.logger.logger.info(f"{name} RESULTS")
         self.logger.logger.info(f"{'=' * 50}")
         self.logger.logger.info(f"Total Score: {total_score:.2f} / {len(dataset)} ({100 * avg_score:.1f}%)")
 
-        for i, (example, prediction, score) in enumerate(results.results):
-            # Handle both "question" (HotPotQA) and "problem" (AIME) fields
-            question_text = getattr(example, "question", None) or getattr(example, "problem", "")
-            question_preview = question_text[:80] if question_text else ""
-            pred_answer = getattr(prediction, "answer", str(prediction))
-            self.logger.logger.info(f"\n[{i + 1}] Q: {question_preview}...")
-            self.logger.logger.info(f"    Gold: {example.answer}")
-            self.logger.logger.info(f"    Pred: {pred_answer}")
-            self.logger.logger.info(f"    Score: {score:.3f}")
-        
         return results
+
+    def _evaluate_single_example(
+        self,
+        program: Module,
+        metric: Any,
+        example: Any,
+    ) -> tuple[Any, float, str | None]:
+        """Run prediction + scoring for one example."""
+        try:
+            prediction = program(**example.inputs())
+            score = float(metric(example, prediction))
+            return prediction, score, None
+        except Exception as e:
+            return dspy.Prediction(), 0.0, str(e)
     
     def _log_prompt_comparison(self, baseline_program: Module, optimized_program: Module) -> None:
         """Log comparison of baseline vs optimized prompts."""
@@ -269,14 +324,9 @@ class ExperimentRunner:
             # candidate is a Module, extract predictor instructions
             for pred_name, pred in candidate.named_predictors():
                 instruction = pred.signature.instructions
-                # Truncate long instructions for display
-                if len(instruction) > 500:
-                    display_instr = instruction[:500] + "... [truncated]"
-                else:
-                    display_instr = instruction
                 self.logger.logger.info(f"  [{pred_name}]:")
                 # Indent multiline instructions
-                for line in display_instr.split("\n"):
+                for line in instruction.split("\n"):
                     self.logger.logger.info(f"    {line}")
         
         # Print score distribution
@@ -317,12 +367,22 @@ class ExperimentRunner:
             
             for name, pred in program.named_predictors():
                 try:
+                    instruction = pred.signature.instructions
+                    markers = self._find_meta_instruction_markers(instruction)
                     prompts_data["predictors"][name] = {
                         "signature": str(pred.signature),
-                        "instructions": pred.signature.instructions,
+                        "instructions": instruction,
                         "input_fields": list(pred.signature.input_fields.keys()),
-                        "output_fields": list(pred.signature.output_fields.keys())
+                        "output_fields": list(pred.signature.output_fields.keys()),
+                        "looks_like_meta_instruction": len(markers) > 0,
+                        "meta_instruction_markers": markers,
                     }
+                    if markers:
+                        self.logger.logger.warning(
+                            "Predictor '%s' instruction may be meta/reflection text (markers: %s)",
+                            name,
+                            ", ".join(markers),
+                        )
                 except Exception as e:
                     prompts_data["predictors"][name] = {"error": str(e)}
             
@@ -364,6 +424,20 @@ class ExperimentRunner:
                 return ""
         
         return str(model_path)
+
+    def _find_meta_instruction_markers(self, instruction: str | None) -> list[str]:
+        """Detect marker phrases that indicate optimizer meta-instructions leaked into task prompt."""
+        normalized = " ".join((instruction or "").lower().split())
+        markers = [
+            "your task is to write a new instruction",
+            "output only the instructions block",
+            "starts with the exact text",
+            "current prompt:",
+            "failure examples:",
+            "inputs_outputs_feedback",
+            "current_instruction_doc",
+        ]
+        return [marker for marker in markers if marker in normalized]
     
     def _config_to_dict(self, config: ExperimentConfig) -> dict[str, Any]:
         """Convert config to dictionary for logging."""
