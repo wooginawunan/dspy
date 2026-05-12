@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import dspy
@@ -79,8 +80,12 @@ class ExperimentRunner:
         self.logger.logger.info("=" * 60)
         
         metric = dataset_adapter.get_metric()
-        baseline_results = self._evaluate_program(program, val_set, metric, "Baseline")
-        self.logger.log_baseline_results(baseline_results, len(val_set))
+        # TODO: this can be skipped if we want to skip the baseline evaluation
+        if self.config.optimizer.name == "baseline":
+            baseline_results = self._evaluate_program(program, val_set, metric, "Baseline")
+            self.logger.log_baseline_results(baseline_results, len(val_set))
+        else:
+            baseline_results = SimpleNamespace(results=[])
         
         # Run optimization (if not baseline)
         optimized_results = None
