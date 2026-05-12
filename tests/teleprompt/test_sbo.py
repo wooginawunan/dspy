@@ -1,16 +1,19 @@
-"""Tests for the `SemanticBundleOptimization._format_example_fields` helper.
+"""Tests for `SemanticBundleOptimization` internals.
 
-These tests exercise the helper against the actual DSPy data structures it sees
-at runtime — `Example.inputs()`, `Example.labels()`, and `Prediction` — across
-the program signatures defined in `benchmarks/programs/qa.py` (single-field QA,
-context-augmented QA, reasoning-first, math). They also cover the fallback
-paths (non-mapping values) and verify that no silent truncation occurs.
+Covers:
+- `_format_example_fields` against real DSPy data structures (`Example.inputs()`,
+  `Example.labels()`, `Prediction`) across the program signatures used in
+  `benchmarks/programs/qa.py`, plus fallback paths and no-truncation guarantees.
+- `_judge_single` (now backed by a `dspy.Predict(JudgeSemanticAlignment)`
+  module): clamping, default-on-failure, and structured-output coercion.
 """
 
 import pytest
 
+import dspy
 from dspy import Example, Prediction
-from dspy.teleprompt.sbo import SemanticBundleOptimization
+from dspy.teleprompt.sbo import JudgeSemanticAlignment, SemanticBundleOptimization
+from dspy.utils.dummies import DummyLM
 
 
 @pytest.fixture
@@ -223,6 +226,99 @@ def test_critique_failure_block_shape(sbo):
     assert failure["input"] == "question: What is the capital of France?"
     assert failure["expected"] == "answer: Paris"
     assert failure["predicted"] == "answer: Lyon"
+
+
+# ---------------------------------------------------------------------------
+# Judge module (dspy.Predict-backed).
+# ---------------------------------------------------------------------------
+
+
+CANDIDATE_PROMPTS = {"answer": "Be concise and precise."}
+REFERENCE_PROMPTS = {"answer": "Answer the question."}
+CRITIQUE = "Responses are too verbose."
+
+
+def _judge_inputs():
+    return {
+        "candidate_prompts": CANDIDATE_PROMPTS,
+        "reference_prompts": REFERENCE_PROMPTS,
+        "critique": CRITIQUE,
+    }
+
+
+def test_judge_signature_fields_match_call_site():
+    """The signature's input fields must match what `_judge_single` passes."""
+    fields = JudgeSemanticAlignment.model_fields
+    assert set(fields) == {"reference_prompt", "critique", "candidate_prompt", "score"}
+    assert fields["score"].annotation is float
+
+
+def test_judge_returns_parsed_score_within_range(sbo):
+    """Happy path: typed float output → returned as-is."""
+    lm = DummyLM([{"score": 0.5}])
+
+    with dspy.context(lm=lm):
+        score = sbo._judge_single(lm=lm, **_judge_inputs())
+
+    assert score == pytest.approx(0.5)
+
+
+def test_judge_clamps_scores_above_one(sbo):
+    """A misbehaving LM that returns >1.0 must be clamped to 1.0."""
+    lm = DummyLM([{"score": 5.0}])
+
+    with dspy.context(lm=lm):
+        score = sbo._judge_single(lm=lm, **_judge_inputs())
+
+    assert score == 1.0
+
+
+def test_judge_clamps_scores_below_negative_one(sbo):
+    lm = DummyLM([{"score": -7.5}])
+
+    with dspy.context(lm=lm):
+        score = sbo._judge_single(lm=lm, **_judge_inputs())
+
+    assert score == -1.0
+
+
+def test_judge_returns_zero_when_module_raises(sbo, monkeypatch):
+    """If the adapter exhausts retries, default to 0.0 (orthogonal) rather than crash."""
+
+    def boom(**_kwargs):
+        raise RuntimeError("adapter retries exhausted")
+
+    monkeypatch.setattr(sbo, "_judge", boom)
+
+    score = sbo._judge_single(lm=DummyLM([]), **_judge_inputs())
+
+    assert score == 0.0
+
+
+def test_judge_returns_zero_when_score_is_uncoercible(sbo, monkeypatch):
+    """Defensive guard: if the module ever yields a non-numeric score, default to 0.0."""
+
+    class FakeResult:
+        score = "not-a-number"
+
+    monkeypatch.setattr(sbo, "_judge", lambda **_kw: FakeResult())
+
+    score = sbo._judge_single(lm=DummyLM([]), **_judge_inputs())
+
+    assert score == 0.0
+
+
+def test_compute_semantic_score_averages_multiple_samples(sbo, monkeypatch):
+    """`_compute_semantic_score` must average `num_judge_samples` judge calls."""
+    sbo.num_judge_samples = 3
+    returned = iter([0.4, 0.6, 0.5])
+    monkeypatch.setattr(sbo, "_judge_single", lambda *a, **kw: next(returned))
+
+    avg = sbo._compute_semantic_score(
+        CANDIDATE_PROMPTS, REFERENCE_PROMPTS, CRITIQUE, lm=DummyLM([])
+    )
+
+    assert avg == pytest.approx(0.5)
 
 
 if __name__ == "__main__":

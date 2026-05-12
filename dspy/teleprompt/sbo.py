@@ -45,6 +45,25 @@ class SBOResult:
     num_null_steps: int
 
 
+class JudgeSemanticAlignment(dspy.Signature):
+    """Quantify how well a Candidate Prompt addresses the Critique relative to the Reference Prompt.
+
+    Scoring rubric:
+    +1.0 (Strong Descent):    Candidate completely resolves the issue.
+    +0.5 (Weak Descent):      Candidate partially fixes the issue.
+     0.0 (Orthogonal):        Candidate ignores the critique.
+    -0.5 (Weak Regression):   Candidate slightly worsens the issue.
+    -1.0 (Strong Regression): Candidate explicitly violates the critique.
+
+    Be objective. Output a single number in [-1.0, 1.0].
+    """
+
+    reference_prompt: str = dspy.InputField(desc="The current prompt being compared against.")
+    critique: str = dspy.InputField(desc="The weakness identified in the reference prompt.")
+    candidate_prompt: str = dspy.InputField(desc="A proposed alternative prompt.")
+    score: float = dspy.OutputField(desc="A number in [-1.0, 1.0] following the rubric.")
+
+
 @experimental(version="3.1.0")
 class SemanticBundleOptimization(Teleprompter):
     """
@@ -118,6 +137,8 @@ class SemanticBundleOptimization(Teleprompter):
         self.track_stats = track_stats
         self.eval_num_threads = max(1, eval_num_threads)
         self.proposer_max_retries = max(0, proposer_max_retries)
+
+        self._judge = dspy.Predict(JudgeSemanticAlignment)
 
         self.result: Optional[SBOResult] = None
 
@@ -891,43 +912,29 @@ JSON:"""
         critique: str,
         lm: LM
     ) -> float:
-        """Single judge evaluation (returns [-1, 1])."""
-        candidate_text = "\n\n".join([f"{k}: {v}" for k, v in candidate_prompts.items()])
-        reference_text = "\n\n".join([f"{k}: {v}" for k, v in reference_prompts.items()])
-
-        judge_prompt = f"""You are an objective optimization judge. Quantify how well the Candidate Prompt addresses the Critique relative to the Reference Prompt.
-
-Reference Prompt:
-{reference_text}
-
-Critique: {critique}
-
-Candidate Prompt:
-{candidate_text}
-
-Scoring Rubric:
-• +1.0 (Strong Descent): Candidate completely resolves the issue
-• +0.5 (Weak Descent): Candidate partially fixes the issue
-• 0.0 (Orthogonal): Candidate ignores the critique
-• -0.5 (Weak Regression): Candidate slightly worsens the issue
-• -1.0 (Strong Regression): Candidate explicitly violates the critique
-
-Output ONLY a single number between -1.0 and 1.0. No explanation.
-
-Score:"""
+        """Single judge evaluation (returns clamped to [-1, 1])."""
+        candidate_text = "\n\n".join(f"{k}: {v}" for k, v in candidate_prompts.items())
+        reference_text = "\n\n".join(f"{k}: {v}" for k, v in reference_prompts.items())
 
         with dspy.context(lm=lm, temperature=0.0):  # Deterministic
-            response = lm(judge_prompt)
+            try:
+                result = self._judge(
+                    reference_prompt=reference_text,
+                    critique=critique,
+                    candidate_prompt=candidate_text,
+                )
+            except Exception as e:
+                # Adapter exhausted retries on a malformed response. Treat as orthogonal.
+                logger.warning("Judge module failed; defaulting score to 0.0: %s", e)
+                return 0.0
 
-        response_text = self._extract_text(response).strip()
-
-        # Parse score
         try:
-            score = float(response_text)
-            return max(-1.0, min(1.0, score))
-        except:
-            logger.warning(f"Failed to parse judge score: {response_text}")
+            score = float(result.score)
+        except (TypeError, ValueError):
+            logger.warning("Failed to coerce judge score %r; defaulting to 0.0.", result.score)
             return 0.0
+
+        return max(-1.0, min(1.0, score))
 
     def _select_best_candidate(
         self,
