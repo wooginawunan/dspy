@@ -4,16 +4,35 @@ Covers:
 - `_format_example_fields` against real DSPy data structures (`Example.inputs()`,
   `Example.labels()`, `Prediction`) across the program signatures used in
   `benchmarks/programs/qa.py`, plus fallback paths and no-truncation guarantees.
-- `_judge_single` (now backed by a `dspy.Predict(JudgeSemanticAlignment)`
-  module): clamping, default-on-failure, and structured-output coercion.
+- `_judge_single` (backed by `dspy.Predict(JudgeSemanticAlignment)`):
+  clamping, default-on-failure, and structured-output coercion.
+- `_generate_candidates` (backed by `dspy.Predict(ProposeCandidates)`):
+  building candidate programs, padding, and graceful proposer failure.
 """
 
 import pytest
 
 import dspy
 from dspy import Example, Prediction
-from dspy.teleprompt.sbo import JudgeSemanticAlignment, SemanticBundleOptimization
+from dspy.teleprompt.sbo import (
+    JudgeSemanticAlignment,
+    ProposeCandidates,
+    SemanticBundleOptimization,
+)
 from dspy.utils.dummies import DummyLM
+
+
+class _SingleSlotProgram(dspy.Module):
+    """Minimal program with one predictor — used as the proposer center."""
+
+    def __init__(self, instruction: str = "Answer the question."):
+        super().__init__()
+        self.answer = dspy.Predict(
+            dspy.Signature("question -> answer", instruction)
+        )
+
+    def forward(self, question: str):
+        return self.answer(question=question)
 
 
 @pytest.fixture
@@ -319,6 +338,112 @@ def test_compute_semantic_score_averages_multiple_samples(sbo, monkeypatch):
     )
 
     assert avg == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Proposer module (dspy.Predict-backed).
+# ---------------------------------------------------------------------------
+
+
+def test_proposer_signature_shape():
+    fields = ProposeCandidates.model_fields
+    assert set(fields) == {"current_prompt", "critique", "num_candidates", "candidates"}
+    assert fields["candidates"].annotation == list[str]
+    assert fields["num_candidates"].annotation is int
+
+
+def test_proposer_builds_one_program_per_candidate(sbo, monkeypatch):
+    """Happy path: proposer returns N strings → N candidate programs are built."""
+    sbo.num_candidates = 3
+
+    fake = type(
+        "FakeResult",
+        (),
+        {"candidates": ["Be concise.", "Be specific.", "Be friendly."]},
+    )()
+    monkeypatch.setattr(sbo, "_propose", lambda **_kw: fake)
+
+    center = _SingleSlotProgram(instruction="Answer the question.")
+    candidates = sbo._generate_candidates(center, critique="too vague", lm=DummyLM([]))
+
+    assert len(candidates) == 3
+    instructions = [
+        sbo._extract_prompts(c)["answer"] for c in candidates
+    ]
+    assert instructions == ["Be concise.", "Be specific.", "Be friendly."]
+
+
+def test_proposer_pads_with_center_when_under_quota(sbo, monkeypatch):
+    """If the proposer returns fewer candidates than requested, pad with center copies."""
+    sbo.num_candidates = 3
+
+    fake = type("FakeResult", (), {"candidates": ["Only one."]})()
+    monkeypatch.setattr(sbo, "_propose", lambda **_kw: fake)
+
+    center = _SingleSlotProgram(instruction="Answer the question.")
+    candidates = sbo._generate_candidates(center, critique="x", lm=DummyLM([]))
+
+    assert len(candidates) == 3
+    instructions = [sbo._extract_prompts(c)["answer"] for c in candidates]
+    assert instructions[0] == "Only one."
+    # The remaining slots are filled with copies of the center.
+    assert instructions[1] == "Answer the question."
+    assert instructions[2] == "Answer the question."
+
+
+def test_proposer_falls_back_to_center_on_module_exception(sbo, monkeypatch):
+    """If the proposer module raises, fall back to center-program copies, don't crash."""
+    sbo.num_candidates = 2
+
+    def boom(**_kw):
+        raise RuntimeError("adapter retries exhausted")
+
+    monkeypatch.setattr(sbo, "_propose", boom)
+
+    center = _SingleSlotProgram(instruction="Answer the question.")
+    candidates = sbo._generate_candidates(center, critique="x", lm=DummyLM([]))
+
+    assert len(candidates) == 2
+    for c in candidates:
+        assert sbo._extract_prompts(c)["answer"] == "Answer the question."
+
+
+def test_proposer_ignores_empty_and_non_string_entries(sbo, monkeypatch):
+    """Whitespace-only, empty, and non-string entries are filtered before building programs."""
+    sbo.num_candidates = 4
+
+    fake = type(
+        "FakeResult",
+        (),
+        {"candidates": ["Valid edit.", "   ", "", None, 42, "Another valid edit."]},
+    )()
+    monkeypatch.setattr(sbo, "_propose", lambda **_kw: fake)
+
+    center = _SingleSlotProgram(instruction="Answer the question.")
+    candidates = sbo._generate_candidates(center, critique="x", lm=DummyLM([]))
+
+    assert len(candidates) == 4
+    instructions = [sbo._extract_prompts(c)["answer"] for c in candidates]
+    # First two come from the proposer, the rest are padded center copies.
+    assert instructions[0] == "Valid edit."
+    assert instructions[1] == "Another valid edit."
+    assert instructions[2] == "Answer the question."
+    assert instructions[3] == "Answer the question."
+
+
+def test_proposer_handles_none_candidates_field(sbo, monkeypatch):
+    """If the proposer returns `candidates=None`, treat as empty and pad."""
+    sbo.num_candidates = 2
+
+    fake = type("FakeResult", (), {"candidates": None})()
+    monkeypatch.setattr(sbo, "_propose", lambda **_kw: fake)
+
+    center = _SingleSlotProgram(instruction="Answer the question.")
+    candidates = sbo._generate_candidates(center, critique="x", lm=DummyLM([]))
+
+    assert len(candidates) == 2
+    for c in candidates:
+        assert sbo._extract_prompts(c)["answer"] == "Answer the question."
 
 
 if __name__ == "__main__":

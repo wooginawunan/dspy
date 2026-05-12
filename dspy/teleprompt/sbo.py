@@ -8,7 +8,6 @@ a "bundle" of historical critiques and using them to construct a cutting-plane m
 """
 
 import logging
-import json
 import random
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -64,6 +63,24 @@ class JudgeSemanticAlignment(dspy.Signature):
     score: float = dspy.OutputField(desc="A number in [-1.0, 1.0] following the rubric.")
 
 
+class ProposeCandidates(dspy.Signature):
+    """Generate distinct local edits of the current prompt that address the critique.
+
+    Each candidate must:
+    1. Make local edits only — do NOT rewrite the prompt from scratch; keep structure similar.
+    2. Address the critique directly.
+    3. Be meaningfully different from the other candidates.
+    4. Contain only the candidate instruction text — no placeholders, headers, or meta-commentary.
+    """
+
+    current_prompt: str = dspy.InputField(desc="The instruction text currently being optimized.")
+    critique: str = dspy.InputField(desc="The weakness the candidates must address.")
+    num_candidates: int = dspy.InputField(desc="Exact number of distinct candidate variations to return.")
+    candidates: list[str] = dspy.OutputField(
+        desc="Candidate instruction texts. Length should equal num_candidates."
+    )
+
+
 @experimental(version="3.1.0")
 class SemanticBundleOptimization(Teleprompter):
     """
@@ -116,7 +133,6 @@ class SemanticBundleOptimization(Teleprompter):
         temperature: float = 0.7,
         track_stats: bool = True,
         eval_num_threads: int = 1,
-        proposer_max_retries: int = 2,
     ):
         super().__init__()
         self.metric = metric
@@ -136,9 +152,9 @@ class SemanticBundleOptimization(Teleprompter):
         self.temperature = temperature
         self.track_stats = track_stats
         self.eval_num_threads = max(1, eval_num_threads)
-        self.proposer_max_retries = max(0, proposer_max_retries)
 
         self._judge = dspy.Predict(JudgeSemanticAlignment)
+        self._propose = dspy.Predict(ProposeCandidates)
 
         self.result: Optional[SBOResult] = None
 
@@ -654,236 +670,61 @@ Critique:"""
         logger.info(f"Proposer prompts: {proposer_prompts}")
 
         if len(proposer_prompts) == 1:
-            # Single-predictor case: provide pure instruction text without predictor-name prefix.
             prompt_text = next(iter(proposer_prompts.values()))
         else:
             prompt_text = "\n\n".join(
-                [f"[COMPONENT: {k}]\n{v}" for k, v in proposer_prompts.items()]
+                f"[COMPONENT: {k}]\n{v}" for k, v in proposer_prompts.items()
             )
 
-        logger.info(f"Proposer prompt text: {prompt_text}")
         if not prompt_text.strip():
             prompt_text = "(no task-specific instruction currently set)"
 
-        proposer_prompt = f"""You are an intelligent optimizer. Generate {self.num_candidates} variations of the prompt that address the critique while preserving the original intent.
+        logger.info(f"Proposer prompt text: {prompt_text}")
 
-Current Prompt:
-{prompt_text}
-
-Critique: {critique}
-
-Constraints:
-1. Local edits only: Do not rewrite the entire prompt from scratch. Keep structure similar.
-2. Focus: Address the critique directly
-3. Diversity: Generate {self.num_candidates} distinct variations
-4. Do NOT repeat this instruction block, do NOT include placeholders.
-5. Return machine-readable JSON only.
-
-Output Format (STRICT):
-{{"candidates": ["<candidate 1 text>", "<candidate 2 text>", ...]}}
-Return exactly {self.num_candidates} strings inside "candidates".
-Do not include markdown/code fences, labels, or any extra keys.
-
-JSON:"""
-
-        response_text = ""
-        cleaned_candidates: list[str] = []
-        for attempt in range(self.proposer_max_retries + 1):
-            attempt_prompt = proposer_prompt
-            if attempt > 0:
-                attempt_prompt += (
-                    "\n\nYour previous output could not be parsed into valid candidates. "
-                    "Return ONLY valid JSON in the exact schema."
-                )
-            logger.info(f"Proposer prompt: {attempt_prompt}")
+        try:
             with dspy.context(lm=lm, temperature=self.temperature):
-                response = lm(attempt_prompt)
-            logger.info(f"Proposer response: {response}")
-            response_text = self._extract_text(response)
-            logger.info(f"Proposer response text: {response_text}")
-            logger.info(f"\n{'='*60}")
-            logger.info("PROPOSER RAW RESPONSE (attempt %d):", attempt + 1)
-            logger.info(f"{response_text}")
-            logger.info(f"{'='*60}\n")
+                result = self._propose(
+                    current_prompt=prompt_text,
+                    critique=critique,
+                    num_candidates=self.num_candidates,
+                )
+            raw_candidates = list(result.candidates or [])
+        except Exception as e:
+            logger.warning("Proposer module failed (%s); will fall back to center program.", e)
+            raw_candidates = []
 
-            parsed_candidates = self._extract_candidate_texts(response_text)
-            logger.info("Parser extracted %d raw candidate blocks.", len(parsed_candidates))
-            cleaned_candidates = [
-                self._clean_candidate_text(candidate_text)
-                for candidate_text in parsed_candidates
-            ]
-            filtered_candidates: list[str] = []
-            for idx, candidate_text in enumerate(cleaned_candidates, 1):
-                if not candidate_text:
-                    logger.info("Discarded candidate %d after cleaning: empty text.", idx)
-                    continue
-                if self._is_placeholder_candidate(candidate_text):
-                    logger.info("Discarded candidate %d after cleaning: placeholder/artifact.", idx)
-                    continue
-                filtered_candidates.append(candidate_text)
-            cleaned_candidates = filtered_candidates
-
-            if len(cleaned_candidates) >= 1:
-                if attempt > 0:
-                    logger.info("Recovered valid candidates after %d retry attempt(s).", attempt)
-                break
-
+        cleaned_candidates = [
+            text.strip()
+            for text in raw_candidates
+            if isinstance(text, str) and text.strip()
+        ]
         for idx, candidate_text in enumerate(cleaned_candidates, 1):
             logger.info(f"Parsed candidate {idx}:\n{candidate_text}")
 
-        # Build candidate programs from parsed texts.
-        candidates = []
+        candidates: list[Module] = []
         for candidate_text in cleaned_candidates[:self.num_candidates]:
             new_prompts = {k: candidate_text for k in center_prompts.keys()}
             candidates.append(self._build_program_from_prompts(center_program, new_prompts))
 
-        # Fallback: if parsing fails, keep the previous split-based parser as a last resort.
-        if len(candidates) == 0:
-            logger.warning("Parser found no candidates; trying legacy fallback parsing.")
-            parts = response_text.split('CANDIDATE')
-            for i, part in enumerate(parts):
-                if i == 0 and not part.strip():
-                    continue
-                lines = part.strip().split('\n')
-                if lines:
-                    first_line = lines[0].strip()
-                    if first_line and (first_line[0].isdigit() or first_line.startswith(':')):
-                        colon_idx = first_line.find(':')
-                        if colon_idx >= 0 and len(first_line) > colon_idx + 1:
-                            lines[0] = first_line[colon_idx + 1:].strip()
-                        else:
-                            lines = lines[1:]
-                candidate_text = self._clean_candidate_text('\n'.join(lines).strip())
-                if not candidate_text or self._is_placeholder_candidate(candidate_text):
-                    logger.info(
-                        "Legacy parser discarded fragment %d (empty/placeholder).",
-                        i,
-                    )
-                    continue
-                logger.info(f"Legacy parsed candidate {len(candidates)+1}:\n{candidate_text}")
-                new_prompts = {k: candidate_text for k in center_prompts.keys()}
-                candidates.append(self._build_program_from_prompts(center_program, new_prompts))
-                if len(candidates) >= self.num_candidates:
-                    break
-
-        # If parsing failed completely, fall back to center program.
-        if len(candidates) == 0:
-            logger.warning("Failed to parse any candidates from LM response, using center program")
+        if not candidates:
+            logger.warning("Proposer returned no usable candidates; using center program.")
             candidates.append(center_program.deepcopy())
-        
-        # Fill remaining slots with center program copies if needed
+
         while len(candidates) < self.num_candidates:
-            logger.warning(f"Only parsed {len(candidates)} candidates, padding with center program")
+            logger.warning(
+                "Only %d candidates available, padding with center program copy.",
+                len(candidates),
+            )
             candidates.append(center_program.deepcopy())
 
+        num_from_proposer = min(len(cleaned_candidates), self.num_candidates)
         logger.info(
-            "Candidate generation summary: returning %d candidates (%d parsed, %d padded/fallback).",
-            len(candidates[:self.num_candidates]),
-            min(len(cleaned_candidates), self.num_candidates),
-            max(0, self.num_candidates - min(len(cleaned_candidates), self.num_candidates)),
+            "Candidate generation summary: returning %d candidates (%d from proposer, %d padded).",
+            self.num_candidates,
+            num_from_proposer,
+            self.num_candidates - num_from_proposer,
         )
         return candidates[:self.num_candidates]
-
-    def _extract_candidate_texts(self, response_text: str) -> list[str]:
-        """Extract candidate strings from JSON output first, then header-based fallback."""
-        json_candidates = self._parse_json_candidates(response_text)
-        if json_candidates:
-            return json_candidates
-        return self._parse_candidates_from_response(response_text)
-
-    def _parse_json_candidates(self, response_text: str) -> list[str]:
-        text = self._strip_code_fences(response_text).strip()
-        if not text:
-            return []
-        try:
-            payload = json.loads(text)
-        except Exception:
-            return []
-
-        if isinstance(payload, dict):
-            candidates = payload.get("candidates", [])
-        elif isinstance(payload, list):
-            candidates = payload
-        else:
-            return []
-
-        if not isinstance(candidates, list):
-            return []
-        return [str(candidate).strip() for candidate in candidates if str(candidate).strip()]
-
-    def _strip_code_fences(self, text: str) -> str:
-        stripped = text.strip()
-        if stripped.startswith("```") and stripped.endswith("```"):
-            stripped = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", stripped)
-            stripped = re.sub(r"\n?```$", "", stripped)
-        return stripped
-
-    def _parse_candidates_from_response(self, response_text: str) -> list[str]:
-        """Extract candidate blocks from strict CANDIDATE headers."""
-        header_pattern = re.compile(r"(?im)^\s*candidate\s*(\d+)\s*:\s*(.*)$")
-        matches = list(header_pattern.finditer(response_text))
-        if not matches:
-            return []
-
-        extracted: list[str] = []
-        for idx, match in enumerate(matches):
-            inline_text = match.group(2).strip()
-            start = match.end()
-            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(response_text)
-            block_text = response_text[start:end].strip()
-            if inline_text and block_text:
-                extracted.append(f"{inline_text}\n{block_text}".strip())
-            elif inline_text:
-                extracted.append(inline_text)
-            elif block_text:
-                extracted.append(block_text)
-        return extracted
-
-    def _clean_candidate_text(self, candidate_text: str) -> str:
-        """Strip echoed prompt boilerplate and keep candidate instruction body."""
-        lines = [line.rstrip() for line in candidate_text.splitlines()]
-        cleaned_lines: list[str] = []
-        stop_markers = (
-            "critique:",
-            "constraints:",
-            "output format:",
-            "example format:",
-            "candidates:",
-            "current prompt:",
-        )
-        skip_exact = {
-            "your first improved prompt text here",
-            "your second improved prompt text here",
-            "your third improved prompt text here",
-        }
-
-        for line in lines:
-            lower = line.strip().lower()
-            if re.match(r"^candidate\s*\d+\s*:", lower):
-                break
-            if any(lower.startswith(marker) for marker in stop_markers):
-                break
-            if lower in skip_exact:
-                continue
-            cleaned_lines.append(line)
-
-        return "\n".join(cleaned_lines).strip()
-
-    def _is_placeholder_candidate(self, candidate_text: str) -> bool:
-        """Detect parser artifacts / placeholder texts that should not become prompts."""
-        lowered = " ".join(candidate_text.lower().split())
-        placeholders = (
-            "your first improved prompt text here",
-            "your second improved prompt text here",
-            "your third improved prompt text here",
-            "on its own line, followed by the improved prompt text",
-            "example format",
-        )
-        if any(phrase in lowered for phrase in placeholders):
-            return True
-        if len(lowered) < 12:
-            return True
-        return False
 
     def _compute_semantic_score(
         self,
