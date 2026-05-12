@@ -82,11 +82,14 @@ class ProposeCandidates(dspy.Signature):
 
 
 class DiagnoseWeakness(dspy.Signature):
-    """You are an expert prompt engineer. Identify the SINGLE most critical weakness
-    in the current prompt given the failure examples.
+    """You are an expert prompt engineer. Analyze the current prompt and failure
+    cases to identify the SINGLE most critical weakness.
 
-    Formulate a specific, actionable critique (e.g., "The prompt is too vague about
-    output formatting"). Do NOT propose a new prompt — state the critique only.
+    Steps:
+    1. Analyze why the prompt failed on the given examples.
+    2. Formulate a specific, actionable critique (e.g., "The prompt is too vague
+       about output formatting").
+    3. Do NOT propose a new prompt — state the critique only.
     """
 
     current_prompt: str = dspy.InputField(desc="The prompt being analyzed.")
@@ -100,12 +103,15 @@ class DiagnoseFailedCandidate(dspy.Signature):
     """You are an expert prompt engineer. A candidate prompt was tested but did not
     improve performance. Explain why and provide a specific, actionable critique
     that would guide the next iteration.
+
+    Loss interpretation: lower is better. The candidate needed to achieve
+    `current_loss < target_loss` and did not. Analyze why this happened.
     """
 
     candidate_prompt: str = dspy.InputField(desc="The candidate prompt that failed to improve performance.")
     failure_context: str = dspy.InputField(desc="Sampled failure cases, or a note that none were available.")
     current_loss: float = dspy.InputField(desc="Loss the candidate achieved (lower is better).")
-    target_loss: float = dspy.InputField(desc="Loss the candidate needed to beat.")
+    target_loss: float = dspy.InputField(desc="Loss the candidate needed to beat (current_loss must be lower).")
     critique: str = dspy.OutputField(
         desc="Why the candidate failed and how to address it. Do not propose a fix."
     )
