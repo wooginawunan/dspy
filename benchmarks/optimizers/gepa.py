@@ -13,7 +13,6 @@ from optimizers.base import OptimizerAdapter
 if TYPE_CHECKING:
     from dspy import Example, Module
 
-
 class GepaAdapter(OptimizerAdapter):
     """Adapter for GEPA optimizer."""
     
@@ -46,21 +45,29 @@ class GepaAdapter(OptimizerAdapter):
         model_config = kwargs.get("model_config", {})
         reflection_model = self.config["params"].get("reflection_lm") or model_config.get("name", "gpt-3.5-turbo")
         api_base = model_config.get("api_base", "http://localhost:11434")
+        # Forward shared model kwargs (e.g., think=false) into reflection LM.
+        shared_lm_params = {
+            key: value
+            for key, value in model_config.items()
+            if key not in {"name", "api_base", "cache", "temperature", "max_tokens"}
+        }
+        params = self.config.get("params", {})
         
         reflection_lm = dspy.LM(
             model=reflection_model,
             api_base=api_base,
-            temperature=1.0,
-            max_tokens=4096,  # Ensure enough tokens for instruction generation
+            temperature=params.get("reflection_temperature", 1.0),
+            max_tokens=params.get("reflection_max_tokens", 4096),  # Ensure enough tokens for instruction generation
+            **shared_lm_params,
         )
 
         optimizer = GEPA(
             metric=metric,
             reflection_lm=reflection_lm,
-            max_metric_calls=self.config["params"].get("max_metric_calls", 50),
+            max_metric_calls=params.get("max_metric_calls", 50),
             num_threads=self.config.get("num_threads", 1),
-            track_stats=self.config["params"].get("track_stats", True),
-            reflection_minibatch_size=self.config["params"].get("reflection_minibatch_size", 3),
+            track_stats=params.get("track_stats", True),
+            reflection_minibatch_size=params.get("reflection_minibatch_size", 3),
         )
 
         return optimizer.compile(program, trainset=train_set, valset=val_set)

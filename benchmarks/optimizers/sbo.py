@@ -13,7 +13,6 @@ from optimizers.base import OptimizerAdapter
 if TYPE_CHECKING:
     from dspy import Example, Module
 
-
 class SBOAdapter(OptimizerAdapter):
     """Adapter for Semantic Bundle Optimization (SBO)."""
 
@@ -46,6 +45,12 @@ class SBOAdapter(OptimizerAdapter):
         model_config = kwargs.get("model_config", {})
         model_name = model_config.get("name", "gpt-3.5-turbo")
         api_base = model_config.get("api_base", "http://localhost:11434")
+        # Forward shared model kwargs (e.g., think=false) into judge/proposer/critic LMs.
+        shared_lm_params = {
+            key: value
+            for key, value in model_config.items()
+            if key not in {"name", "api_base", "cache", "temperature", "max_tokens"}
+        }
 
         # Get LM configurations from params
         params = self.config.get("params", {})
@@ -56,7 +61,8 @@ class SBOAdapter(OptimizerAdapter):
             model=judge_lm_name,
             api_base=api_base,
             temperature=0.0,  # Deterministic for judge
-            max_tokens=10,  # Judge only outputs a number
+            max_tokens=params.get("judge_max_tokens", 32),  # Keep short but avoid tiny truncation budgets.
+            **shared_lm_params,
         )
 
         # Proposer LM (for generating candidates)
@@ -65,7 +71,8 @@ class SBOAdapter(OptimizerAdapter):
             model=proposer_lm_name,
             api_base=api_base,
             temperature=params.get("proposer_temperature", 0.7),
-            max_tokens=2048,
+            max_tokens=params.get("proposer_max_tokens", 2048),
+            **shared_lm_params,
         )
 
         # Critic LM (for generating critiques)
@@ -74,7 +81,8 @@ class SBOAdapter(OptimizerAdapter):
             model=critic_lm_name,
             api_base=api_base,
             temperature=params.get("critic_temperature", 0.7),
-            max_tokens=1024,
+            max_tokens=params.get("critic_max_tokens", 2048),
+            **shared_lm_params,
         )
 
         # Create SBO optimizer
@@ -95,6 +103,7 @@ class SBOAdapter(OptimizerAdapter):
             max_null_steps=params.get("max_null_steps", 5),
             temperature=params.get("temperature", 0.7),
             track_stats=params.get("track_stats", True),
+            eval_num_threads=self.config.get("num_threads", 1),
         )
 
         # Run optimization
