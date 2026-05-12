@@ -153,84 +153,20 @@ class SemanticBundleOptimization(Teleprompter):
             return str(response)
         return str(response)
 
-    def _format_critique_payload(
-        self,
-        value: Any,
-        preferred_keys: tuple[str, ...] = (),
-        prefer_scalar: bool = False
-    ) -> str:
-        """Format DSPy objects for critique prompts without wrapper noise."""
-        payload = value
-        if hasattr(payload, "items"):
+    def _format_example_fields(self, value: Example | Prediction | Any) -> str:
+        """Render the fields of a DSPy Example/Prediction as 'key: value' lines.
+
+        Trusts the DSPy data structure to expose the right fields:
+        - `ex.inputs()` already isolates the program's input fields.
+        - `ex.labels()` already isolates the gold-output fields.
+        - `Prediction.items()` already reflects the program signature's outputs.
+        """
+        if hasattr(value, "items"):
             try:
-                payload = dict(payload.items())
+                return "\n".join(f"{key}: {field}" for key, field in value.items())
             except Exception:
-                pass
-
-        if isinstance(payload, dict):
-            # Skip known bulky/noisy fields unless explicitly preferred.
-            noisy_keys = {
-                "context", "metadata", "trace", "history", "demos",
-                "input_keys", "_input_keys", "_store", "id",
-                "gold_titles", "type"
-            }
-            filtered: dict[str, Any] = {}
-            for key in preferred_keys:
-                if key in payload:
-                    filtered[key] = payload[key]
-
-            for key, raw_value in payload.items():
-                if key in filtered:
-                    continue
-                if key in noisy_keys and key not in preferred_keys:
-                    continue
-                if isinstance(raw_value, (str, int, float, bool)) or raw_value is None:
-                    filtered[key] = raw_value
-                elif isinstance(raw_value, (list, tuple)):
-                    # Keep small scalar lists only.
-                    if len(raw_value) <= 5 and all(
-                        isinstance(item, (str, int, float, bool)) or item is None
-                        for item in raw_value
-                    ):
-                        filtered[key] = list(raw_value)
-                elif isinstance(raw_value, set):
-                    # Sets are usually tiny label collections (e.g., gold_titles).
-                    if len(raw_value) <= 5 and all(
-                        isinstance(item, (str, int, float, bool)) or item is None
-                        for item in raw_value
-                    ):
-                        filtered[key] = sorted(raw_value, key=str)
-
-            payload = filtered if filtered else {
-                key: payload[key]
-                for key in preferred_keys
-                if key in payload
-            }
-
-        if prefer_scalar and isinstance(payload, dict):
-            for key in preferred_keys:
-                if key in payload:
-                    payload = payload[key]
-                    break
-            else:
-                # Fallback to first scalar value if preferred keys are unavailable.
-                for raw_value in payload.values():
-                    if isinstance(raw_value, (str, int, float, bool)) or raw_value is None:
-                        payload = raw_value
-                        break
-
-        try:
-            if isinstance(payload, (dict, list, tuple, set)):
-                text = json.dumps(payload, ensure_ascii=True, sort_keys=True, default=str)
-            else:
-                text = str(payload)
-        except Exception:
-            text = str(payload)
-
-        max_chars = 350
-        if len(text) > max_chars:
-            text = f"{text[:max_chars]}..."
-        return text
+                return str(value)
+        return str(value)
 
     def compile(
         self,
@@ -267,13 +203,17 @@ class SemanticBundleOptimization(Teleprompter):
         original_prompts = self._extract_prompts(student)
         logger.info(f"\n{'='*60}")
         logger.info(f"INITIAL PROMPTS EXTRACTED:")
-        for pred_name, prompt_text in original_prompts.items():
-            logger.info(f"  [{pred_name}]: {prompt_text}")
+        # We only optimize the instruction part of the prompt, not the context.
+        # TODO: confirm this after we have other programs used. 
+        for pred_name, instruction in original_prompts.items():
+            logger.info(f"  [{pred_name}]: {instruction}")
         logger.info(f"{'='*60}\n")
 
         original_loss = self._evaluate_program(student, valset)
         logger.info(f"Original loss on valset: {original_loss:.4f}")
 
+        # Generate initial critique 
+        # TODO: add the addition step to generate reasoning per example first
         initial_critique = self._generate_critique(student, trainset, original_prompts, critic_lm)
         logger.info(f"\nINITIAL CRITIQUE:")
         logger.info(f"  {initial_critique}")
@@ -576,23 +516,11 @@ class SemanticBundleOptimization(Teleprompter):
             try:
                 pred = program(**ex.inputs())
                 score = self.metric(ex, pred, None)
-                if score < 0.8:  # Consider as failure
+                if score < 0.8:  # TODO: Is this appropriate to use this threshold?
                     failures.append({
-                        "input": self._format_critique_payload(
-                            ex.inputs(),
-                            preferred_keys=("question", "query", "prompt", "instruction"),
-                            prefer_scalar=True
-                        ),
-                        "expected": self._format_critique_payload(
-                            ex.labels(),
-                            preferred_keys=("answer", "answers", "label", "labels", "output", "gold", "gold_answer"),
-                            prefer_scalar=True
-                        ),
-                        "predicted": self._format_critique_payload(
-                            pred,
-                            preferred_keys=("answer", "answers", "label", "output", "completion", "response"),
-                            prefer_scalar=True
-                        ),
+                        "input": self._format_example_fields(ex.inputs()),
+                        "expected": self._format_example_fields(ex.labels()),
+                        "predicted": self._format_example_fields(pred),
                         "score": float(score)
                     })
             except:
@@ -650,21 +578,9 @@ Critique:"""
                 score = self.metric(ex, pred, None)
                 if score < 0.8:  # Consider as failure
                     failures.append({
-                        "input": self._format_critique_payload(
-                            ex.inputs(),
-                            preferred_keys=("question", "query", "prompt", "instruction"),
-                            prefer_scalar=True
-                        ),
-                        "expected": self._format_critique_payload(
-                            ex.labels(),
-                            preferred_keys=("answer", "answers", "label", "labels", "output", "gold", "gold_answer"),
-                            prefer_scalar=True
-                        ),
-                        "predicted": self._format_critique_payload(
-                            pred,
-                            preferred_keys=("answer", "answers", "label", "output", "completion", "response"),
-                            prefer_scalar=True
-                        ),
+                        "input": self._format_example_fields(ex.inputs()),
+                        "expected": self._format_example_fields(ex.labels()),
+                        "predicted": self._format_example_fields(pred),
                         "score": float(score)
                     })
             except Exception:
