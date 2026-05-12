@@ -81,6 +81,36 @@ class ProposeCandidates(dspy.Signature):
     )
 
 
+class DiagnoseWeakness(dspy.Signature):
+    """You are an expert prompt engineer. Identify the SINGLE most critical weakness
+    in the current prompt given the failure examples.
+
+    Formulate a specific, actionable critique (e.g., "The prompt is too vague about
+    output formatting"). Do NOT propose a new prompt — state the critique only.
+    """
+
+    current_prompt: str = dspy.InputField(desc="The prompt being analyzed.")
+    failure_examples: str = dspy.InputField(desc="Formatted failure cases with input/expected/predicted/score.")
+    critique: str = dspy.OutputField(
+        desc="A specific, actionable weakness in the current prompt. Do not propose a fix."
+    )
+
+
+class DiagnoseFailedCandidate(dspy.Signature):
+    """You are an expert prompt engineer. A candidate prompt was tested but did not
+    improve performance. Explain why and provide a specific, actionable critique
+    that would guide the next iteration.
+    """
+
+    candidate_prompt: str = dspy.InputField(desc="The candidate prompt that failed to improve performance.")
+    failure_context: str = dspy.InputField(desc="Sampled failure cases, or a note that none were available.")
+    current_loss: float = dspy.InputField(desc="Loss the candidate achieved (lower is better).")
+    target_loss: float = dspy.InputField(desc="Loss the candidate needed to beat.")
+    critique: str = dspy.OutputField(
+        desc="Why the candidate failed and how to address it. Do not propose a fix."
+    )
+
+
 @experimental(version="3.1.0")
 class SemanticBundleOptimization(Teleprompter):
     """
@@ -155,40 +185,10 @@ class SemanticBundleOptimization(Teleprompter):
 
         self._judge = dspy.Predict(JudgeSemanticAlignment)
         self._propose = dspy.Predict(ProposeCandidates)
+        self._critique = dspy.Predict(DiagnoseWeakness)
+        self._failure_critique = dspy.Predict(DiagnoseFailedCandidate)
 
         self.result: Optional[SBOResult] = None
-
-    def _extract_text(self, response: Any) -> str:
-        """Normalize LM responses into plain text across providers/adapters."""
-        if response is None:
-            return ""
-        if isinstance(response, str):
-            return response
-        if isinstance(response, list):
-            if not response:
-                return ""
-            return self._extract_text(response[0])
-        if isinstance(response, dict):
-            # Common response shapes across SDKs/providers.
-            for key in ("text", "content", "completion", "response", "output"):
-                value = response.get(key)
-                if value is not None:
-                    return self._extract_text(value)
-            # OpenAI-like: {"message": {"content": "..."}}
-            message = response.get("message")
-            if message is not None:
-                return self._extract_text(message)
-            choices = response.get("choices")
-            if isinstance(choices, list) and choices:
-                first = choices[0]
-                if isinstance(first, dict):
-                    if "text" in first:
-                        return self._extract_text(first.get("text"))
-                    if "message" in first:
-                        return self._extract_text(first.get("message"))
-            # Last-resort fallback for unexpected dicts.
-            return str(response)
-        return str(response)
 
     def _format_example_fields(self, value: Example | Prediction | Any) -> str:
         """Render the fields of a DSPy Example/Prediction as 'key: value' lines.
@@ -539,6 +539,38 @@ class SemanticBundleOptimization(Teleprompter):
         except Exception as e:
             return 1.0, str(e)
 
+    def _sample_failures(
+        self,
+        program: Module,
+        examples: list[Example],
+        sample_size: int = 3,
+        score_threshold: float = 0.8,
+    ) -> list[dict[str, Any]]:
+        """Run `program` on a small sample and collect cases that score below threshold."""
+        failures: list[dict[str, Any]] = []
+        for ex in random.sample(examples, min(sample_size, len(examples))):
+            try:
+                pred = program(**ex.inputs())
+                score = self.metric(ex, pred, None)
+            except Exception:
+                continue
+            if score < score_threshold:
+                failures.append({
+                    "input": self._format_example_fields(ex.inputs()),
+                    "expected": self._format_example_fields(ex.labels()),
+                    "predicted": self._format_example_fields(pred),
+                    "score": float(score),
+                })
+        return failures
+
+    def _format_failures(self, failures: list[dict[str, Any]]) -> str:
+        """Render failure dicts as the block consumed by critique modules."""
+        return "\n\n".join(
+            f"Example {i+1}:\nInput: {f['input']}\nExpected: {f['expected']}\n"
+            f"Predicted: {f['predicted']}\nScore: {f['score']:.2f}"
+            for i, f in enumerate(failures)
+        )
+
     def _generate_critique(
         self,
         program: Module,
@@ -547,52 +579,26 @@ class SemanticBundleOptimization(Teleprompter):
         lm: LM
     ) -> str:
         """Generate critique identifying weaknesses in the program."""
-        # Sample a few failure cases
-        failures = []
-        for ex in random.sample(examples, min(3, len(examples))):
-            try:
-                pred = program(**ex.inputs())
-                score = self.metric(ex, pred, None)
-                if score < 0.8:  # TODO: Is this appropriate to use this threshold?
-                    failures.append({
-                        "input": self._format_example_fields(ex.inputs()),
-                        "expected": self._format_example_fields(ex.labels()),
-                        "predicted": self._format_example_fields(pred),
-                        "score": float(score)
-                    })
-            except:
-                pass
+        failures = self._sample_failures(program, examples)
 
         if not failures:
             return "The prompt is performing well on the given examples."
 
-        # Format critique generation prompt
-        prompt_text = "\n\n".join([f"{k}: {v}" for k, v in prompts.items()])
-        failures_text = "\n\n".join([
-            f"Example {i+1}:\nInput: {f['input']}\nExpected: {f['expected']}\nPredicted: {f['predicted']}\nScore: {f['score']:.2f}"
-            for i, f in enumerate(failures)
-        ])
+        prompt_text = "\n\n".join(f"{k}: {v}" for k, v in prompts.items())
+        failures_text = self._format_failures(failures)
 
-        critique_prompt = f"""You are an expert prompt engineer. Analyze the following prompt and failure cases to identify the single most critical weakness.
-
-Current Prompt:
-{prompt_text}
-
-Failure Examples:
-{failures_text}
-
-Instructions:
-1. Analyze why the prompt failed on these examples
-2. Formulate a specific, actionable critique (e.g., "The prompt is too vague about output formatting")
-3. Do NOT suggest a new prompt. Only state the critique.
-
-Critique:"""
-
-        logger.info(f"Critique prompt: {critique_prompt}")
         with dspy.context(lm=lm, temperature=self.temperature):
-            response = lm(critique_prompt)
+            try:
+                result = self._critique(
+                    current_prompt=prompt_text,
+                    failure_examples=failures_text,
+                )
+            except Exception as e:
+                logger.warning("Critique module failed (%s); returning generic critique.", e)
+                return "The prompt failed on some examples; refine its specificity."
 
-        return self._extract_text(response).strip()
+        logger.info(f"Critique result: {result.critique}")
+        return result.critique.strip()
 
     def _generate_failure_critique(
         self,
@@ -607,52 +613,24 @@ Critique:"""
         eval_examples = random.sample(examples, min(3, len(examples)))
         current_loss = self._evaluate_program(program, eval_examples)
 
-        prompt_text = "\n\n".join([f"{k}: {v}" for k, v in prompts.items()])
-        failures = []
-        for ex in random.sample(eval_examples, min(3, len(eval_examples))):
-            try:
-                pred = program(**ex.inputs())
-                score = self.metric(ex, pred, None)
-                if score < 0.8:  # Consider as failure
-                    failures.append({
-                        "input": self._format_example_fields(ex.inputs()),
-                        "expected": self._format_example_fields(ex.labels()),
-                        "predicted": self._format_example_fields(pred),
-                        "score": float(score)
-                    })
-            except Exception:
-                continue
+        prompt_text = "\n\n".join(f"{k}: {v}" for k, v in prompts.items())
+        failures = self._sample_failures(program, eval_examples)
+        failures_text = self._format_failures(failures) if failures else "No sampled examples available."
 
-        failures_text = "No sampled examples available."
-        if failures:
-            failures_text = "\n\n".join([
-                f"Example {i+1}:\nInput: {f['input']}\nExpected: {f['expected']}\nPredicted: {f['predicted']}\nScore: {f['score']:.2f}"
-                for i, f in enumerate(failures)
-            ])
-
-        critique_prompt = f"""You are an expert prompt engineer. A candidate prompt was tested but failed to improve performance.
-
-Candidate Prompt:
-{prompt_text}
-
-Sampled Failure Context:
-{failures_text}
-
-Current Loss: {current_loss:.4f}
-Target Loss: {target_loss:.4f}
-(Lower is better. Candidate should achieve loss < {target_loss:.4f} but didn't)
-
-Analyze why this candidate failed to improve performance. Provide a specific, actionable critique.
-
-Critique:"""
-
-        logger.info(f"Critique prompt: {critique_prompt}")
         with dspy.context(lm=critic_lm, temperature=self.temperature):
-            response = critic_lm(critique_prompt)
+            try:
+                result = self._failure_critique(
+                    candidate_prompt=prompt_text,
+                    failure_context=failures_text,
+                    current_loss=current_loss,
+                    target_loss=target_loss,
+                )
+            except Exception as e:
+                logger.warning("Failure-critique module failed (%s); returning generic critique.", e)
+                return "The candidate did not improve loss; revisit how it addresses the prior critique."
 
-        logger.info(f"Critique response: {response}")
-        logger.info(f"Critique response text: {self._extract_text(response).strip()}")
-        return self._extract_text(response).strip()
+        logger.info(f"Failure-critique result: {result.critique}")
+        return result.critique.strip()
 
     def _generate_candidates(
         self,

@@ -8,6 +8,9 @@ Covers:
   clamping, default-on-failure, and structured-output coercion.
 - `_generate_candidates` (backed by `dspy.Predict(ProposeCandidates)`):
   building candidate programs, padding, and graceful proposer failure.
+- `_generate_critique` and `_generate_failure_critique` (backed by
+  `dspy.Predict(DiagnoseWeakness)` / `dspy.Predict(DiagnoseFailedCandidate)`):
+  failure sampling, formatting, and module-level fallbacks.
 """
 
 import pytest
@@ -15,6 +18,8 @@ import pytest
 import dspy
 from dspy import Example, Prediction
 from dspy.teleprompt.sbo import (
+    DiagnoseFailedCandidate,
+    DiagnoseWeakness,
     JudgeSemanticAlignment,
     ProposeCandidates,
     SemanticBundleOptimization,
@@ -444,6 +449,211 @@ def test_proposer_handles_none_candidates_field(sbo, monkeypatch):
     assert len(candidates) == 2
     for c in candidates:
         assert sbo._extract_prompts(c)["answer"] == "Answer the question."
+
+
+# ---------------------------------------------------------------------------
+# Critique modules (DiagnoseWeakness, DiagnoseFailedCandidate).
+# ---------------------------------------------------------------------------
+
+
+def test_critique_signature_shapes():
+    weakness_fields = DiagnoseWeakness.model_fields
+    assert set(weakness_fields) == {"current_prompt", "failure_examples", "critique"}
+    assert weakness_fields["critique"].annotation is str
+
+    failed_fields = DiagnoseFailedCandidate.model_fields
+    assert set(failed_fields) == {
+        "candidate_prompt",
+        "failure_context",
+        "current_loss",
+        "target_loss",
+        "critique",
+    }
+    assert failed_fields["current_loss"].annotation is float
+    assert failed_fields["target_loss"].annotation is float
+
+
+def test_format_failures_renders_expected_block(sbo):
+    rendered = sbo._format_failures([
+        {"input": "question: q1", "expected": "answer: a", "predicted": "answer: b", "score": 0.25},
+        {"input": "question: q2", "expected": "answer: c", "predicted": "answer: d", "score": 0.10},
+    ])
+
+    assert rendered == (
+        "Example 1:\nInput: question: q1\nExpected: answer: a\n"
+        "Predicted: answer: b\nScore: 0.25\n\n"
+        "Example 2:\nInput: question: q2\nExpected: answer: c\n"
+        "Predicted: answer: d\nScore: 0.10"
+    )
+
+
+def test_sample_failures_only_collects_below_threshold(sbo, monkeypatch):
+    """Only examples scoring < threshold should be returned as failures."""
+    examples = [
+        Example(question="good", answer="g").with_inputs("question"),
+        Example(question="bad", answer="x").with_inputs("question"),
+    ]
+
+    program = _SingleSlotProgram()
+    monkeypatch.setattr(
+        program,
+        "forward",
+        lambda question: Prediction(answer=f"pred-{question}"),
+    )
+    sbo.metric = lambda ex, pred, _trace: 1.0 if ex.question == "good" else 0.0
+
+    failures = sbo._sample_failures(program, examples, sample_size=2, score_threshold=0.8)
+
+    assert len(failures) == 1
+    assert failures[0]["input"] == "question: bad"
+    assert failures[0]["score"] == 0.0
+
+
+def test_sample_failures_skips_examples_that_raise(sbo, monkeypatch):
+    """If a program call raises, the example is dropped silently — never propagated."""
+    examples = [
+        Example(question="ok", answer="a").with_inputs("question"),
+        Example(question="explodes", answer="b").with_inputs("question"),
+    ]
+
+    program = _SingleSlotProgram()
+
+    def maybe_boom(question):
+        if question == "explodes":
+            raise RuntimeError("program crashed")
+        return Prediction(answer="pred")
+
+    monkeypatch.setattr(program, "forward", maybe_boom)
+    sbo.metric = lambda *a, **kw: 0.0
+
+    failures = sbo._sample_failures(program, examples, sample_size=2)
+    inputs = sorted(f["input"] for f in failures)
+
+    assert inputs == ["question: ok"]
+
+
+def test_generate_critique_returns_no_failure_message_when_all_pass(sbo, monkeypatch):
+    """If sampling finds no failures, return the canned 'performing well' message
+    and skip the LM call entirely."""
+    monkeypatch.setattr(sbo, "_sample_failures", lambda *a, **kw: [])
+
+    def must_not_call(**_kw):
+        raise AssertionError("LM module must not be invoked when there are no failures")
+
+    monkeypatch.setattr(sbo, "_critique", must_not_call)
+
+    critique = sbo._generate_critique(
+        program=_SingleSlotProgram(),
+        examples=[Example(question="q", answer="a").with_inputs("question")],
+        prompts={"answer": "Answer the question."},
+        lm=DummyLM([]),
+    )
+
+    assert critique == "The prompt is performing well on the given examples."
+
+
+def test_generate_critique_returns_module_output(sbo, monkeypatch):
+    """Happy path: critique module is called with the formatted prompt/failures and its
+    stripped output is returned."""
+    captured: dict = {}
+
+    monkeypatch.setattr(
+        sbo,
+        "_sample_failures",
+        lambda *a, **kw: [
+            {"input": "i", "expected": "e", "predicted": "p", "score": 0.1}
+        ],
+    )
+
+    def fake_critique(**kwargs):
+        captured.update(kwargs)
+        return type("R", (), {"critique": "  Too vague about formatting.  "})()
+
+    monkeypatch.setattr(sbo, "_critique", fake_critique)
+
+    out = sbo._generate_critique(
+        program=_SingleSlotProgram(),
+        examples=[Example(question="q", answer="a").with_inputs("question")],
+        prompts={"answer": "Answer the question."},
+        lm=DummyLM([]),
+    )
+
+    assert out == "Too vague about formatting."
+    assert captured["current_prompt"] == "answer: Answer the question."
+    assert "Score: 0.10" in captured["failure_examples"]
+
+
+def test_generate_critique_falls_back_when_module_raises(sbo, monkeypatch):
+    monkeypatch.setattr(
+        sbo,
+        "_sample_failures",
+        lambda *a, **kw: [
+            {"input": "i", "expected": "e", "predicted": "p", "score": 0.1}
+        ],
+    )
+
+    def boom(**_kw):
+        raise RuntimeError("adapter retries exhausted")
+
+    monkeypatch.setattr(sbo, "_critique", boom)
+
+    out = sbo._generate_critique(
+        program=_SingleSlotProgram(),
+        examples=[Example(question="q", answer="a").with_inputs("question")],
+        prompts={"answer": "p"},
+        lm=DummyLM([]),
+    )
+
+    assert out == "The prompt failed on some examples; refine its specificity."
+
+
+def test_generate_failure_critique_passes_losses_to_module(sbo, monkeypatch):
+    """The failure-critique module must receive the typed loss values, not strings."""
+    captured: dict = {}
+
+    monkeypatch.setattr(sbo, "_evaluate_program", lambda *a, **kw: 0.6)
+    monkeypatch.setattr(sbo, "_sample_failures", lambda *a, **kw: [])
+
+    def fake_failure_critique(**kwargs):
+        captured.update(kwargs)
+        return type("R", (), {"critique": "Candidate ignored the prior critique."})()
+
+    monkeypatch.setattr(sbo, "_failure_critique", fake_failure_critique)
+
+    out = sbo._generate_failure_critique(
+        program=_SingleSlotProgram(),
+        examples=[Example(question="q", answer="a").with_inputs("question")],
+        prompts={"answer": "p"},
+        target_loss=0.4,
+        critic_lm=DummyLM([]),
+    )
+
+    assert out == "Candidate ignored the prior critique."
+    assert captured["current_loss"] == pytest.approx(0.6)
+    assert captured["target_loss"] == pytest.approx(0.4)
+    assert captured["failure_context"] == "No sampled examples available."
+
+
+def test_generate_failure_critique_falls_back_when_module_raises(sbo, monkeypatch):
+    monkeypatch.setattr(sbo, "_evaluate_program", lambda *a, **kw: 0.5)
+    monkeypatch.setattr(sbo, "_sample_failures", lambda *a, **kw: [])
+
+    def boom(**_kw):
+        raise RuntimeError("adapter retries exhausted")
+
+    monkeypatch.setattr(sbo, "_failure_critique", boom)
+
+    out = sbo._generate_failure_critique(
+        program=_SingleSlotProgram(),
+        examples=[Example(question="q", answer="a").with_inputs("question")],
+        prompts={"answer": "p"},
+        target_loss=0.3,
+        critic_lm=DummyLM([]),
+    )
+
+    assert out == (
+        "The candidate did not improve loss; revisit how it addresses the prior critique."
+    )
 
 
 if __name__ == "__main__":
